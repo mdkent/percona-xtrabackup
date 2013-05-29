@@ -35,9 +35,11 @@ Other Types of Backups
 
    incremental_backups_innobackupex
    partial_backups_innobackupex
+   compact_backups_innobackupex
+   encrypted_backups_innobackupex
 
-Proficiency
-===========
+Advanced Features
+=================
 
 .. toctree::
    :maxdepth: 1
@@ -46,7 +48,6 @@ Proficiency
    replication_ibk
    parallel_copy_ibk
    throttling_ibk
-   remote_backups_ibk
    importing_exporting_tables_ibk
    pit_recovery_ibk
 

@@ -1,10 +1,12 @@
+.. _xb_incremental:
+
 =====================
  Incremental Backups
 =====================
 
 Both |xtrabackup| and |innobackupex| tools supports incremental backups, which means that it can copy only the data that has changed since the last full backup. You can perform many incremental backups between each full backup, so you can set up a backup process such as a full backup once a week and an incremental backup every day, or full backups every day and incremental backups every hour.
 
-Incremental backups work because each InnoDB page (usually 16kb in size) contains a log sequence number, or :term:`LSN`. The :term:`LSN` is the system version number for the entire database. Each page's :term:`LSN` shows how recently it was changed. An incremental backup copies each page whose :term:`LSN` is newer than the previous incremental or full backup's :term:`LSN`.
+Incremental backups work because each InnoDB page (usually 16kb in size) contains a log sequence number, or :term:`LSN`. The :term:`LSN` is the system version number for the entire database. Each page's :term:`LSN` shows how recently it was changed. An incremental backup copies each page whose :term:`LSN` is newer than the previous incremental or full backup's :term:`LSN`. There are two algorithms in use to find the set of such pages to be copied. The first one, available with all the server types and versions, is to check the page :term:`LSN` directly by reading all the data pages. The second one, available with |Percona Server|, is to enable the `changed page tracking <http://www.percona.com/doc/percona-server/5.5/management/changed_page_tracking.html>`_ feature on the server, which will note the pages as they are being changed. This information will be then written out in a compact separate so-called bitmap file. The |xtrabackup| binary will use that file to read only the data pages it needs for the incremental backup, potentially saving many read requests. The latter algorithm is enabled by default if the |xtrabackup| binary finds the bitmap file. It is possible to specify :option:`--incremental-force-scan` to read all the pages even if the bitmap data is available.
 
 Incremental backups do not actually compare the data files to the previous backup's data files. In fact, you can use :option:`--incremental-lsn` to perform an incremental backup without even having the previous backup, if you know its :term:`LSN`. Incremental backups simply read the pages and compare their :term:`LSN` to the last backup's :term:`LSN`. You still need a full backup to recover the incremental changes, however; without a full backup to act as a base, the incremental backups are useless.
 
@@ -42,7 +44,7 @@ The meaning should be self-evident. It's now possible to use this directory as t
 Preparing the Incremental Backups
 =================================
 
-The :option:`--prepare` step for incremental backups is not the same as for normal backups. In normal backups, two types of operations are performed to make the database consistent: committed transactions are replayed from the log file against the data files, and uncommitted transactions are rolled back. For technical reasons, you must skip the rollback of uncommitted transactions when preparing a backup that will be used as the base for an incremental backup. You should use the :option:`--apply-log-only` option to prevent the rollback phase.
+The :option:`--prepare` step for incremental backups is not the same as for normal backups. In normal backups, two types of operations are performed to make the database consistent: committed transactions are replayed from the log file against the data files, and uncommitted transactions are rolled back. You must skip the rollback of uncommitted transactions when preparing a backup, because transactions that were uncommitted at the time of your backup may be in progress, and it's likely that they will be committed in the next incremental backup. You should use the :option:`--apply-log-only` option to prevent the rollback phase.
 
 **If you do not use the** :option:`--apply-log-only` **option to prevent the rollback phase, then your incremental backups will be useless**. After transactions have been rolled back, further incremental backups cannot be applied.
 
@@ -84,7 +86,11 @@ Again, the |LSN| should match what you saw from your earlier inspection of the f
 
 Preparing the second incremental backup is a similar process: apply the deltas to the (modified) base backup, and you will roll its data forward in time to the point of the second incremental backup: ::
 
-  xtrabackup --prepare --apply-log-only --target-dir=/data/backups/base \
+  xtrabackup --prepare --target-dir=/data/backups/base \
   --incremental-dir=/data/backups/inc2
+
+.. note::
+ 
+ :option:`--apply-log-only` should be used when merging all incrementals except the last one. That's why the previous line doesn't contain the :option:`--apply-log-only` option. Even if the :option:`--apply-log-only` was used on the last step, backup would still be consistent but in that case server would perform the rollback phase.
 
 If you wish to avoid the notice that |InnoDB| was not shut down normally, when you have applied the desired deltas to the base backup, you can run :option:`--prepare` again without disabling the rollback phase.

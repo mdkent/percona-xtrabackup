@@ -24,27 +24,75 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 #include <my_global.h>
 #include <my_dir.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct datasink_struct;
+typedef struct datasink_struct datasink_t;
 
 typedef struct ds_ctxt {
-	struct datasink_struct	*datasink;
-	char 			*root;
-	void			*ptr;
-	struct ds_ctxt		*pipe_ctxt;
+	datasink_t	*datasink;
+	char 		*root;
+	void		*ptr;
+	struct ds_ctxt	*pipe_ctxt;
 } ds_ctxt_t;
 
 typedef struct {
-	void 			*ptr;
-	char 			*path;
-	struct datasink_struct	*datasink;
+	void		*ptr;
+	char		*path;
+	datasink_t	*datasink;
 } ds_file_t;
 
-typedef struct datasink_struct {
+struct datasink_struct {
 	ds_ctxt_t *(*init)(const char *root);
 	ds_file_t *(*open)(ds_ctxt_t *ctxt, const char *path, MY_STAT *stat);
 	int (*write)(ds_file_t *file, const void *buf, size_t len);
 	int (*close)(ds_file_t *file);
 	void (*deinit)(ds_ctxt_t *ctxt);
-} datasink_t;
+};
+
+/* Supported datasink types */
+typedef enum {
+	DS_TYPE_STDOUT,
+	DS_TYPE_LOCAL,
+	DS_TYPE_ARCHIVE,
+	DS_TYPE_XBSTREAM,
+	DS_TYPE_COMPRESS,
+	DS_TYPE_ENCRYPT,
+	DS_TYPE_TMPFILE,
+	DS_TYPE_BUFFER
+} ds_type_t;
+
+/************************************************************************
+Create a datasink of the specified type */
+ds_ctxt_t *ds_create(const char *root, ds_type_t type);
+
+/************************************************************************
+Open a datasink file */
+ds_file_t *ds_open(ds_ctxt_t *ctxt, const char *path, MY_STAT *stat);
+
+/************************************************************************
+Write to a datasink file.
+@return 0 on success, 1 on error. */
+int ds_write(ds_file_t *file, const void *buf, size_t len);
+
+/************************************************************************
+Close a datasink file.
+@return 0 on success, 1, on error. */
+int ds_close(ds_file_t *file);
+
+/************************************************************************
+Destroy a datasink handle */
+void ds_destroy(ds_ctxt_t *ctxt);
+
+/************************************************************************
+Set the destination pipe for a datasink (only makes sense for compress and
+tmpfile). */
+void ds_set_pipe(ds_ctxt_t *ctxt, ds_ctxt_t *pipe_ctxt);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif /* XB_DATASINK_H */

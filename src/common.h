@@ -24,12 +24,13 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 #include <my_global.h>
 #include <mysql_version.h>
 #include <fcntl.h>
+#include <stdarg.h>
 
 #define xb_a(expr)							\
 	do {								\
 		if (!(expr)) {						\
 			msg("Assertion \"%s\" failed at %s:%lu\n",	\
-			    #expr, __FILE__, (unsigned long) __LINE__); \
+			    #expr, __FILE__, (ulong) __LINE__);		\
 			abort();					\
 		}							\
 	} while (0);
@@ -39,6 +40,8 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 #else
 #define xb_ad(expr)
 #endif
+
+#define XB_DELTA_INFO_SUFFIX ".meta"
 
 static inline int msg(const char *fmt, ...) ATTRIBUTE_FORMAT(printf, 1, 2);
 static inline int msg(const char *fmt, ...)
@@ -61,13 +64,29 @@ static inline int msg(const char *fmt, ...)
 /* Use POSIX_FADV_NORMAL when available */
 
 #ifdef POSIX_FADV_NORMAL
-#define USE_POSIX_FADVISE
+# define USE_POSIX_FADVISE
+#else
+# define POSIX_FADV_NORMAL
+# define POSIX_FADV_SEQUENTIAL
+# define POSIX_FADV_DONTNEED
+# define posix_fadvise(a,b,c,d) do {} while(0)
 #endif
 
-typedef enum {
-	XB_STREAM_FMT_NONE,
-	XB_STREAM_FMT_TAR,
-	XB_STREAM_FMT_XBSTREAM
-} xb_stream_fmt_t;
+/***********************************************************************
+Computes bit shift for a given value. If the argument is not a power
+of 2, returns 0.*/
+static inline ulong
+get_bit_shift(ulong value)
+{
+    ulong shift;
+
+    if (value == 0)
+	return 0;
+
+    for (shift = 0; !(value & 1UL); shift++) {
+	value >>= 1;
+    }
+    return (value >> 1) ? 0 : shift;
+}
 
 #endif

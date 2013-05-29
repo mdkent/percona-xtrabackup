@@ -24,14 +24,15 @@ checksum_a=`checksum_table test test`
 cat >$topdir/tables <<EOF
 test.test
 EOF
+ib_part_add_mandatory_tables $mysql_datadir $topdir/tables
 innobackupex --no-timestamp --tables-file=$topdir/tables $topdir/backup
 innobackupex --apply-log $topdir/backup
 vlog "Backup taken"
 
 COUNT=`xtrabackup --stats --tables-file=$topdir/tables --datadir=$topdir/backup \
-       | grep table: | awk '{print $2}' | sort -u | wc -l`
+       | grep table: | grep -v SYS_ | awk '{print $2}' | sort -u | wc -l`
 echo "COUNT = $COUNT"
-if [ $COUNT != 7 ] ; then
+if [ $COUNT != 5 ] ; then
 	vlog "xtrabackup --stats does not work"
 	exit -1
 fi

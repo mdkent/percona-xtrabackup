@@ -1,32 +1,53 @@
 # Makefile to build XtraBackup for Percona Server and different versions of MySQL
 #
 # Syntax:
-# make [5.1|5.5|plugin|xtradb|xtradb55]
+# make [5.1|5.5|5.6|plugin|xtradb|xtradb55]
 #
 # Default is xtradb - to build XtraBackup for Percona Server 5.1
 # xtradb55 - Xtrabackup for Percona Server 5.5
 # 5.1 - XtraBackup for MySQL versions 5.1.* with builtin InnoDB
 # plugin - XtraBackup for MySQL versions 5.1.* with InnoDB plugin
 # 5.5 - XtraBackup for MySQL versions 5.5.*	
+# 5.6 - XtraBackup for MySQL version 5.6
 
-LIBS += -lpthread
+LIBS += -lpthread `libgcrypt-config --libs`
 DEFS = -DUNIV_LINUX -DMYSQL_SERVER
 
-CFLAGS += -DXTRABACKUP_VERSION=\"$(XTRABACKUP_VERSION)\" -pedantic -Wall -Wundef -Wshadow  -fdiagnostics-show-option  -fno-strict-aliasing -Wno-strict-aliasing -Wextra -Wformat -Wno-format-nonliteral -Wno-format-security -Wno-long-long  -Wmissing-declarations  -Wno-redundant-decls --std=gnu99
+COMMON_FLAGS = -g -DXTRABACKUP_VERSION=\"$(XTRABACKUP_VERSION)\" -pedantic -Wall -fdiagnostics-show-option  -fno-strict-aliasing -Wno-strict-aliasing -Wextra -Wformat -Wno-format-nonliteral -Wno-format-security -Wno-long-long  -Wmissing-declarations  -Wno-redundant-decls # -Wundef -Wshadow
+CFLAGS += $(COMMON_FLAGS) --std=gnu99
+CXXFLAGS += $(COMMON_FLAGS)
 
 ifneq ($(DEBUG),)
-CFLAGS += -DXB_DEBUG=1
+CFLAGS += -DXB_DEBUG=1 -DUNIV_DEBUG
+CXXFLAGS += -DXB_DEBUG=1 -DUNIV_DEBUG
 endif
 
 TARGET=xtrabackup
 PREFIX=/usr
 BIN_DIR=$(PREFIX)/bin
 
-COMMON_INC = -I. -I libarchive/libarchive -I quicklz
-XTRABACKUPOBJS = xtrabackup.o stream.o local.o compress.o buffer.o \
+COMMON_INC = -I. -I libarchive/libarchive -I quicklz `libgcrypt-config --cflags`
+XTRABACKUPCOBJS = \
+	ds_archive.o \
+	ds_xbstream.o \
+	ds_local.o \
+	ds_stdout.o \
+	ds_compress.o \
+	ds_encrypt.o \
+	xbcrypt_common.o \
+	xbcrypt_write.o \
+	ds_tmpfile.o \
+	ds_buffer.o \
+	datasink.o \
 	xbstream_write.o \
 	quicklz/quicklz.o
+XTRABACKUPCCOBJS = xtrabackup.o innodb_int.o compact.o fil_cur.o write_filt.o \
+	changed_page_bitmap.o \
+	read_filt.o
+
 XBSTREAMOBJS = xbstream.o xbstream_write.o xbstream_read.o
+
+XBCRYPTOBJS = xbcrypt.o xbcrypt_common.o xbcrypt_read.o xbcrypt_write.o
 
 LIBARCHIVE_A = libarchive/libarchive/libarchive.a
 
@@ -53,7 +74,7 @@ default: xtradb
 5.1: MYSQLOBJS= $(addprefix $(MYSQL_ROOT_DIR)/, mysys/libmysys.a  \
 	strings/libmystrings.a zlib/.libs/libzlt.a dbug/libdbug.a)
 5.1: TARGET := xtrabackup_51
-5.1: $(TARGET) xbstream
+5.1: $(TARGET) xbstream xbcrypt
 
 # XtraBackup for MySQL with InnoDB Plugin
 plugin: INC = $(COMMON_INC) $(addprefix -I$(MYSQL_ROOT_DIR)/, \
@@ -79,11 +100,11 @@ plugin: INNODBOBJS = $(addprefix \
 plugin: MYSQLOBJS = $(addprefix $(MYSQL_ROOT_DIR)/, mysys/libmysys.a \
 	strings/libmystrings.a zlib/.libs/libzlt.a dbug/libdbug.a)
 plugin: TARGET := xtrabackup_plugin
-plugin: $(TARGET) xbstream
+plugin: $(TARGET) xbstream xbcrypt
 
 # XtraBackup for MySQL 5.5
 5.5: INC = $(COMMON_INC) $(addprefix -isystem$(MYSQL_ROOT_DIR)/, \
-	include storage/innobase/include)
+	include storage/innobase/include sql)
 5.5: INNODBOBJS = $(MYSQL_ROOT_DIR)/storage/innobase/libinnobase.a
 
 ifeq "$(wildcard $(MYSQL_ROOT_DIR)/zlib/.libs/libzlt.a)" ""
@@ -103,7 +124,30 @@ endif
 5.5: DEFS = $(shell grep C_DEFINES \
 	$(MYSQL_ROOT_DIR)/storage/innobase/CMakeFiles/innobase.dir/flags.make | \
 	sed -e 's/C_DEFINES = //')
-5.5: $(TARGET) xbstream
+5.5: $(TARGET) xbstream xbcrypt
+
+# XtraBackup for MySQL 5.6
+5.6: INC = $(COMMON_INC) $(addprefix -isystem$(MYSQL_ROOT_DIR)/, \
+	include sql storage/innobase/include sql)
+5.6: INNODBOBJS =
+
+ifeq "$(wildcard $(MYSQL_ROOT_DIR)/zlib/.libs/libzlt.a)" ""
+5.6: LIBZ= -lz
+else
+5.6: LIBZ= $(MYSQL_ROOT_DIR)/zlib/.libs/libzlt.a
+endif
+
+5.6: MYSQLOBJS = $(MYSQL_ROOT_DIR)/libmysqld/libmysqld.a
+ifeq ($(shell uname -s),Linux)
+5.6: LIBS += -laio -ldl -lcrypt -lssl
+endif
+5.6: TARGET := xtrabackup_56
+# In CMake server builds it is important to build with exactly the same preprocessor flags
+# as were used to build InnoDB
+5.6: DEFS = $(shell grep CXX_DEFINES \
+	$(MYSQL_ROOT_DIR)/storage/innobase/CMakeFiles/innobase.dir/flags.make | \
+	sed -e 's/CXX_DEFINES = //')
+5.6: $(TARGET) xbstream xbcrypt
 
 # XtraBackup for XtraDB 
 xtradb: INC = $(COMMON_INC) $(addprefix -isystem$(MYSQL_ROOT_DIR)/, \
@@ -144,11 +188,11 @@ xtradb: MYSQLOBJS = $(addprefix $(MYSQL_ROOT_DIR)/, mysys/libmysys.a \
 	strings/libmystrings.a zlib/.libs/libzlt.a dbug/libdbug.a)
 xtradb: DEFS += -DXTRADB_BASED 
 xtradb: TARGET := xtrabackup 
-xtradb: $(TARGET) xbstream
+xtradb: $(TARGET) xbstream xbcrypt
 
 # XtraBackup for XtraDB 5.5
 xtradb55: INC = $(COMMON_INC) $(addprefix -isystem$(MYSQL_ROOT_DIR)/, \
-	include storage/innobase/include)
+	include storage/innobase/include sql)
 xtradb55: INNODBOBJS = $(MYSQL_ROOT_DIR)/storage/innobase/libinnobase.a
 ifeq ($(shell uname -s),Linux)
 xtradb55: LIBS += -laio
@@ -169,22 +213,38 @@ xtradb55: DEFS = $(shell grep C_DEFINES \
 	sed -e 's/C_DEFINES = //')
 xtradb55: DEFS += -DXTRADB_BASED -DXTRADB55
 xtradb55: TARGET := xtrabackup_55
-xtradb55: $(TARGET) xbstream
+xtradb55: $(TARGET) xbstream xbcrypt
 
-$(XTRABACKUPOBJS): %.o: %.c
+$(XTRABACKUPCOBJS): %.o: %.c
 	$(CC) $(CFLAGS) $(INC) $(DEFS) -c $< -o $@
+
+$(XTRABACKUPCCOBJS): %.o: %.cc
+	$(CXX) $(CXXFLAGS) $(INC) $(DEFS) -c $< -o $@
 
 xbstream.o xbstream_read.o: %.o: %.c
 	$(CC) $(CFLAGS) $(INC) $(DEFS) -c $< -o $@
 
-xbstream: $(XBSTREAMOBJS) $(MYSQLOBJS) local.o
-	$(CC) $(CFLAGS) $^ $(INC) $(MYSQLOBJS) $(LIBS) -o $@
+xbstream: $(XBSTREAMOBJS) $(MYSQLOBJS) ds_local.o ds_buffer.o ds_stdout.o datasink.o
+	$(CXX) $(CXXFLAGS) $^ $(INC) $(MYSQLOBJS) $(LIBS) -o $@
 
-xtrabackup.o: xtrabackup.c xb_regex.h
+xbcrypt.o xbcrypt_read.o: %.o: %.c
+	$(CC) $(CFLAGS) $(INC) $(DEFS) -c $< -o $@
 
-$(TARGET): $(XTRABACKUPOBJS) $(INNODBOBJS) $(MYSQLOBJS) $(LIBARCHIVE_A)
-	$(CC) $(CFLAGS) $(XTRABACKUPOBJS) $(INNODBOBJS) $(MYSQLOBJS) $(LIBS) \
+xbcrypt: $(XBCRYPTOBJS) $(MYSQLOBJS)
+	$(CXX) $(CXXFLAGS) $^ $(INC) $(MYSQLOBJS) $(LIBS) -o $@
+
+changed_page_bitmap.o: changed_page_bitmap.cc changed_page_bitmap.h innodb_int.h \
+	common.h xtrabackup.h
+
+read_filt.o: read_filt.cc read_filt.h fil_cur.h xtrabackup.h innodb_int.h \
+	common.h changed_page_bitmap.h
+
+xtrabackup.o: xtrabackup.cc xb_regex.h write_filt.h fil_cur.h xtrabackup.h compact.h \
+	common.h changed_page_bitmap.h read_filt.h innodb_int.h
+
+$(TARGET): $(XTRABACKUPCCOBJS) $(XTRABACKUPCOBJS) $(INNODBOBJS) $(MYSQLOBJS) $(LIBARCHIVE_A)
+	$(CXX) $(CXXFLAGS) $(XTRABACKUPCCOBJS) $(XTRABACKUPCOBJS) $(INNODBOBJS) $(MYSQLOBJS) $(LIBS) \
 	$(LIBARCHIVE_A) -o $(TARGET)
 
 clean:
-	rm -f $(XTRABACKUPOBJS) $(XBSTREAMOBJS) xtrabackup xtrabackup_* 
+	rm -f $(XTRABACKUPCCOBJS) $(XTRABACKUPCOBJS) $(XBSTREAMOBJS) $(XBCRYPTOBJS) xtrabackup xtrabackup_*

@@ -85,9 +85,9 @@ REVISION="$(cd "$SOURCEDIR"; bzr revno)"
 
 # Compilation flags
 export CC=${CC:-gcc}
-export CXX=${CXX:-gcc}
-export CFLAGS="-fPIC -Wall -O3 -g -static-libgcc -fno-omit-frame-pointer ${CFLAGS:-}"
-export CXXFLAGS="-O2 -fno-omit-frame-pointer -g -pipe -Wall -Wp,-D_FORTIFY_SOURCE=2 -fno-exceptions ${CXXFLAGS:-}"
+export CXX=${CXX:-g++}
+export CFLAGS="-fPIC -Wall -O3 -g -static-libgcc -fno-omit-frame-pointer -DXTRABACKUP_REVISION=\\\"$REVISION\\\" ${CFLAGS:-}"
+export CXXFLAGS="-O2 -fno-omit-frame-pointer -g -pipe -Wall -Wp,-D_FORTIFY_SOURCE=2 -DXTRABACKUP_REVISION=\\\"$REVISION\\\" ${CXXFLAGS:-}"
 export MAKE_JFLAG=-j4
 
 # Create a temporary working directory
@@ -118,13 +118,15 @@ export AUTO_DOWNLOAD=yes
         bash utils/build.sh xtradb55
         install -m 755 src/xtrabackup_55 "$INSTALLDIR/bin"
 
+        bash utils/build.sh innodb56
+        install -m 755 src/xtrabackup_56 "$INSTALLDIR/bin"
+
         bash utils/build.sh xtradb
         install -m 755 src/xtrabackup "$INSTALLDIR/bin"
 
-        bash utils/build.sh 5.1
-        install -m 755 src/xtrabackup_51 "$INSTALLDIR/bin"
-
         install -m 755 src/xbstream "$INSTALLDIR/bin"
+
+	install -m 755 src/xbcrypt "$INSTALLDIR/bin"
 
         install -m 755 innobackupex "$INSTALLDIR/bin"
         ln -s innobackupex "$INSTALLDIR/bin/innobackupex-1.5.1"
@@ -133,17 +135,26 @@ export AUTO_DOWNLOAD=yes
 
         cp -R test "$INSTALLDIR/share/percona-xtrabackup-test"
 
-    ) || false
+    )
+    exit_value=$?
 
-    $TAR czf "percona-xtrabackup-$XTRABACKUP_VERSION-$REVISION.tar.gz" \
-        --owner=0 --group=0 -C "$INSTALLDIR/../" \
-        "percona-xtrabackup-$XTRABACKUP_VERSION"
+    if test "x$exit_value" = "x0"
+    then
+        $TAR czf "percona-xtrabackup-$XTRABACKUP_VERSION-$REVISION.tar.gz" \
+            --owner=0 --group=0 -C "$INSTALLDIR/../" \
+            "percona-xtrabackup-$XTRABACKUP_VERSION"
+    fi
 
     # Clean up build dir
     rm -rf "percona-xtrabackup-$XTRABACKUP_VERSION"
     
-) || false
+    exit $exit_value
+    
+)
+exit_value=$?
 
 # Clean up
 rm -rf "$WORKDIR_ABS/$BASEINSTALLDIR"
+
+exit $exit_value
 

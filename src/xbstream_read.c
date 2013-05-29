@@ -18,6 +18,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 
 *******************************************************/
 
+#include <mysql_version.h>
 #include <my_base.h>
 #include <zlib.h>
 #include "common.h"
@@ -70,7 +71,7 @@ validate_chunk_type(uchar code)
 	}
 }
 
-#define F_READ(buf,len)                                           	\
+#define F_READ(buf,len)                                       	\
 	do {                                                      	\
 		if (my_read(fd, buf, len, MYF(MY_WME|MY_FULL_IO)) ==	\
 		    MY_FILE_ERROR) {					\
@@ -93,7 +94,7 @@ xb_stream_read_chunk(xb_rstream_t *stream, xb_rstream_chunk_t *chunk)
 	size_t		tbytes;
 	ulonglong	ullval;
 	ulong		checksum_exp;
-	ulong		checksum;;
+	ulong		checksum;
 	File		fd = stream->fd;
 
 	xb_ad(sizeof(tmpbuf) >= CHUNK_HEADER_CONSTANT_LEN);

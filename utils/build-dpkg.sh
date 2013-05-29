@@ -73,19 +73,20 @@ SOURCEDIR="$(cd $(dirname "$0"); cd ..; pwd)"
 . $SOURCEDIR/VERSION
 
 DEBIAN_VERSION="$(lsb_release -sc)"
-REVISION="$(cd "$SOURCEDIR"; bzr log -r-1 | grep ^revno: | cut -d ' ' -f 2)"
+REVISION="$(cd "$SOURCEDIR"; bzr revno)"
 FULL_VERSION="$XTRABACKUP_VERSION-$REVISION.$DEBIAN_VERSION"
 
 # Build information
 export CC=${CC:-gcc}
-export CXX=${CXX:-gcc}
+export CXX=${CXX:-g++}
 export CFLAGS="-fPIC -Wall -O3 -g -static-libgcc -fno-omit-frame-pointer"
-export CXXFLAGS="-O2 -fno-omit-frame-pointer -g -pipe -Wall -Wp,-D_FORTIFY_SOURCE=2 -fno-exceptions"
+export CXXFLAGS="-O2 -fno-omit-frame-pointer -g -pipe -Wall -Wp,-D_FORTIFY_SOURCE=2"
 export MAKE_JFLAG=-j4
 
 export DEB_BUILD_OPTIONS='debug nocheck'
-export DEB_CFLAGS_APPEND="$CFLAGS"
-export DEB_CXXFLAGS_APPEND="$CXXFLAGS"
+export DEB_CFLAGS_APPEND="$CFLAGS -DXTRABACKUP_REVISION=\\\"$REVISION\\\""
+export DEB_CXXFLAGS_APPEND="$CXXFLAGS -DXTRABACKUP_REVISION=\\\"$REVISION\\\""
+export DEB_DUMMY="$DUMMY"
 
 # Build
 (
@@ -103,12 +104,6 @@ export DEB_CXXFLAGS_APPEND="$CXXFLAGS"
         if test "x$NOTRANSITIONAL" = "xyes"
         then
             sed -i '/Package: xtrabackup/,/^$/d' debian/control
-        fi
-
-        # Apply dummy patch if wanted
-        if test "x$DUMMY" = "xyes"
-        then
-            patch -p1 < 'utils/debian-dummy-rules.patch'
         fi
 
         # Update distribution

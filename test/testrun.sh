@@ -70,6 +70,7 @@ function set_vars()
     find_program MYSQLD mysqld $MYSQL_BASEDIR/bin/ $MYSQL_BASEDIR/libexec
     find_program MYSQL mysql $MYSQL_BASEDIR/bin
     find_program MYSQLADMIN mysqladmin $MYSQL_BASEDIR/bin
+    find_program MYSQLDUMP mysqldump $MYSQL_BASEDIR/bin
 
     # Check if we are running from a source tree and, if so, set PATH 
     # appropriately
@@ -85,10 +86,26 @@ function set_vars()
     else
 	LD_LIBRARY_PATH=$MYSQL_BASEDIR/lib/mysql:$LD_LIBRARY_PATH
     fi
+    DYLD_LIBRARY_PATH="$LD_LIBRARY_PATH"
 
     export TEST_BASEDIR PORT_BASE TAR MYSQL_BASEDIR MYSQL MYSQLD MYSQLADMIN \
-MYSQL_INSTALL_DB PATH LD_LIBRARY_PATH
+MYSQL_INSTALL_DB PATH LD_LIBRARY_PATH DYLD_LIBRARY_PATH MYSQLDUMP
 }
+
+
+# Fix innodb51 test failures on Centos5-32 Jenkins slaves due to SELinux
+# preventing shared symbol relocations in ha_innodb_plugin.so.0.0.0
+function fix_selinux()
+{
+    if which lsb_release &>/dev/null && \
+        lsb_release -d | grep CentOS &>/dev/null && \
+        lsb_release -r | egrep '5.[0-9]' &>/dev/null && \
+        which chcon &>/dev/null
+    then
+        chcon -t textrel_shlib_t $MYSQL_BASEDIR/lib/plugin/ha_innodb_plugin.so.0.0.0
+    fi
+}
+
 
 function get_version_info()
 {
@@ -107,9 +124,13 @@ function get_version_info()
 		XB_BIN="xtrabackup_51";;
 	    "innodb51" )
 		XB_BIN="xtrabackup_plugin"
-		MYSQLD_EXTRA_ARGS="--ignore-builtin-innodb --plugin-load=innodb=ha_innodb_plugin.so";;
+		MYSQLD_EXTRA_ARGS="--ignore-builtin-innodb --plugin-load=innodb=ha_innodb_plugin.so"
+	        fix_selinux
+		;;
 	    "innodb55" )
 		XB_BIN="xtrabackup_innodb55";;
+            "innodb56" | "xtradb56" | "mariadb100")
+                XB_BIN="xtrabackup_56" ;;
 	    "xtradb51" | "mariadb51" | "mariadb52" | "mariadb53")
 		XB_BIN="xtrabackup";;
 	    "xtradb55" | "mariadb55")
@@ -138,6 +159,9 @@ function get_version_info()
     INNODB_VERSION=${INNODB_VERSION#"innodb_version	"}
     XTRADB_VERSION="`echo $INNODB_VERSION  | sed 's/[0-9]\.[0-9]\.[0-9][0-9]*\(-[0-9][0-9]*\.[0-9][0-9]*\)*$/\1/'`"
 
+    # Version-specific defaults
+    DEFAULT_IBDATA_SIZE="10M"
+
     # Determine MySQL flavor
     if [[ "$MYSQL_VERSION" =~ "MariaDB" ]]
     then
@@ -154,16 +178,13 @@ function get_version_info()
     then
 	INNODB_FLAVOR="XtraDB"
     else
-	INNODB_FLAVOR="innoDB"
+	INNODB_FLAVOR="InnoDB"
     fi
 
     if [ "$XB_BUILD" = "autodetect" ]
     then
         # Determine xtrabackup build automatically
-	if [ "${MYSQL_VERSION:0:3}" = "5.0" ]
-	then
-	    XB_BIN="xtrabackup_51"
-	elif [ "${MYSQL_VERSION:0:3}" = "5.1" ]
+	if [ "${MYSQL_VERSION:0:3}" = "5.1" ]
 	then
 	    if [ -z "$INNODB_VERSION" ]
 	    then
@@ -171,8 +192,7 @@ function get_version_info()
 	    else
 		XB_BIN="xtrabackup"    # InnoDB 5.1 plugin or Percona Server 5.1
 	    fi
-	elif [ "${MYSQL_VERSION:0:3}" = "5.2" -o
-	       "${MYSQL_VERSION:0:3}" = "5.3"]
+	elif [ "${MYSQL_VERSION:0:3}" = "5.2" -o "${MYSQL_VERSION:0:3}" = "5.3" ]
 	then
 	    XB_BIN="xtrabackup"
 	elif [ "${MYSQL_VERSION:0:3}" = "5.5" ]
@@ -183,8 +203,12 @@ function get_version_info()
 	    else
 		XB_BIN="xtrabackup_innodb55"
 	    fi
+        elif [ "${MYSQL_VERSION:0:3}" = "5.6" -o "${MYSQL_VERSION:0:4}" = "10.0" ]
+        then
+            XB_BIN="xtrabackup_56"
+            DEFAULT_IBDATA_SIZE="12M"
 	else
-	    vlog "Uknown MySQL/InnoDB version: $MYSQL_VERSION/$INNODB_VERSION"
+	    vlog "Unknown MySQL/InnoDB version: $MYSQL_VERSION/$INNODB_VERSION"
 	    exit -1
 	fi
     fi
@@ -209,7 +233,8 @@ function get_version_info()
 
     export MYSQL_VERSION MYSQL_VERSION_COMMENT MYSQL_FLAVOR \
 	INNODB_VERSION XTRADB_VERSION INNODB_FLAVOR \
-	XB_BIN IB_BIN IB_ARGS XB_ARGS MYSQLD_EXTRA_ARGS
+	XB_BIN IB_BIN IB_ARGS XB_ARGS MYSQLD_EXTRA_ARGS \
+        DEFAULT_IBDATA_SIZE XB_BUILD
 }
 
 export SKIPPED_EXIT_CODE=200

@@ -1,9 +1,17 @@
+################################################################################
+# Bug #1062684: Applying incremental backup using xtrabackup 2.0.3 fails when
+#               innodb_data_file_path = ibdata1:2000M;ibdata2:10M:autoextend is
+#               set in [mysqld]
+################################################################################
+
 . inc/common.sh
 
-start_server --innodb-data-file-path="ibdata1:10M;ibdata2:5M:autoextend"
-load_dbase_schema incremental_sample
+MYSQLD_EXTRA_MY_CNF_OPTS="
+innodb-data-file-path=ibdata1:${DEFAULT_IBDATA_SIZE};ibdata2:5M:autoextend
+"
 
-echo "innodb-data-file-path=ibdata1:10M;ibdata2:5M:autoextend" >>$topdir/my.cnf
+start_server
+load_dbase_schema incremental_sample
 
 # Adding initial rows
 vlog "Adding initial rows to database..."
@@ -76,7 +84,7 @@ vlog "###########"
 innobackupex --copy-back $full_backup_dir
 vlog "Data restored"
 
-start_server --innodb-data-file-path="ibdata1:10M;ibdata2:5M:autoextend"
+start_server --innodb-data-file-path="ibdata1:${DEFAULT_IBDATA_SIZE};ibdata2:5M:autoextend"
 
 vlog "Checking checksums"
 checksum_test_b=`checksum_table incremental_sample test`

@@ -21,11 +21,12 @@ TARGET_CFLAGS=''
 TARGET_ARG=''
 SIGN='--sign'  # We sign by default
 TEST='no'    # We don't test by default
+DUMMY=''
 
 # Check if we have got a functional getopt(1)
 if ! getopt --test
 then
-    go_out="$(getopt --options="iKt" --longoptions=i686,nosign,test \
+    go_out="$(getopt --options="iKtn" --longoptions=i686,nosign,test,dummy \
         --name="$(basename "$0")" -- "$@")"
     test $? -eq 0 || exit 1
     eval set -- $go_out
@@ -48,6 +49,10 @@ do
     -t | --test )
         shift
         TEST='yes'
+        ;;
+    -n | --dummy )
+        shift
+        DUMMY='--define=dummy=1'
         ;;
     esac
 done
@@ -95,7 +100,7 @@ test -e "$SOURCEDIR/VERSION" || exit 2
 # Build information
 REDHAT_RELEASE="$(grep -o 'release [0-9][0-9]*' /etc/redhat-release | \
     cut -d ' ' -f 2)"
-REVISION="$(cd "$SOURCEDIR"; bzr log -r-1 | grep ^revno: | cut -d ' ' -f 2)"
+REVISION="$(cd "$SOURCEDIR"; bzr revno)"
 
 # Fix problems in rpmbuild for rhel4: _libdir and _arch are not correctly set.
 if test "x$REDHAT_RELEASE" == "x4" && test "x$TARGET_ARG" == "xi686"
@@ -109,9 +114,9 @@ fi
 
 # Compilation flags
 export CC=${CC:-gcc}
-export CXX=${CXX:-gcc}
+export CXX=${CXX:-g++}
 export CFLAGS="-fPIC -Wall -O3 -g -static-libgcc -fno-omit-frame-pointer $TARGET_CFLAGS"
-export CXXFLAGS="-O2 -fno-omit-frame-pointer -g -pipe -Wall -Wp,-D_FORTIFY_SOURCE=2 -fno-exceptions $TARGET_CFLAGS"
+export CXXFLAGS="-O2 -fno-omit-frame-pointer -g -pipe -Wall -Wp,-D_FORTIFY_SOURCE=2 $TARGET_CFLAGS"
 export MAKE_JFLAG=-j4
 
 export MYSQL_RPMBUILD_TEST="$TEST"
@@ -129,7 +134,7 @@ export MYSQL_RPMBUILD_TEST="$TEST"
             "$SOURCEDIR"
 
     # Issue RPM command
-    rpmbuild $SIGN $TARGET $TARGET_LIBDIR $TARGET_ARCH \
+    rpmbuild $SIGN $TARGET $TARGET_LIBDIR $TARGET_ARCH $DUMMY \
         -ba --clean "$SOURCEDIR/utils/xtrabackup.spec" \
         --define "_topdir $WORKDIR_ABS" \
         --define "xtrabackup_version $XTRABACKUP_VERSION" \

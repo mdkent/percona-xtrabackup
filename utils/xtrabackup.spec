@@ -19,11 +19,10 @@ Packager: Percona Development Team <mysql-dev@percona.com>
 URL: http://www.percona.com/software/percona-xtrabackup/
 Source: percona-xtrabackup-%{xtrabackup_version}.tar.gz
 BuildRoot: %{_tmppath}/%{name}-%{version}-root
-Requires: mysql
 Provides: xtrabackup
 Obsoletes: xtrabackup
-BuildRequires: libaio-devel
-AutoReqProv: no
+BuildRequires: libaio-devel, libgcrypt-devel
+Requires: perl(DBD::mysql)
 
 %description
 Percona XtraBackup is OpenSource online (non-blockable) backup solution for InnoDB and XtraDB engines.
@@ -33,6 +32,7 @@ Summary: Test suite for Percona Xtrabackup
 Group: Applications/Databases
 Requires: percona-xtrabackup
 AutoReqProv: no
+Requires: /usr/bin/mysql
 
 %description test
 This package contains the test suite for Percona Xtrabackup
@@ -58,16 +58,26 @@ This package contains the test suite for Percona Xtrabackup
 
 %build
 set -ue
+%if %{undefined dummy}
 export CC=${CC-"gcc"}
-export CXX=$CC
+export CXX=${CXX-"g++"}
 export CFLAGS="$CFLAGS -DXTRABACKUP_VERSION=\\\"%{xtrabackup_version}\\\" -DXTRABACKUP_REVISION=\\\"%{xtrabackup_revision}\\\"" 
-export CXXFLAGS="$CXXFLAGS -DXTRABACKUP_VERSION=\\\"%{xtrabackup_version}\\\" -DXTRABACKUP_REVISION=\\\"%{xtrabackup_revision}\\\" -fno-exceptions" 
-AUTO_DOWNLOAD=yes ./utils/build.sh 5.1
-cp src/xtrabackup_51 src/xbstream .
+export CXXFLAGS="$CXXFLAGS -DXTRABACKUP_VERSION=\\\"%{xtrabackup_version}\\\" -DXTRABACKUP_REVISION=\\\"%{xtrabackup_revision}\\\"" 
 AUTO_DOWNLOAD=yes ./utils/build.sh xtradb
-cp src/xtrabackup .
+cp src/xtrabackup . 
 AUTO_DOWNLOAD=yes ./utils/build.sh xtradb55
-cp src/xtrabackup_55 .
+cp src/xtrabackup_55 src/xbstream src/xbcrypt .
+AUTO_DOWNLOAD=yes ./utils/build.sh xtradb56
+cp src/xtrabackup_56 .
+%else
+# Dummy binaries that avoid compilation
+echo 'main() { return 300; }' | gcc -x c - -o xtrabackup
+echo 'main() { return 300; }' | gcc -x c - -o xtrabackup_51
+echo 'main() { return 300; }' | gcc -x c - -o xtrabackup_55
+echo 'main() { return 300; }' | gcc -x c - -o xtrabackup_56
+echo 'main() { return 300; }' | gcc -x c - -o xbstream
+echo 'main() { return 300; }' | gcc -x c - -o xbcrypt
+%endif
 
 %install
 [ "%{buildroot}" != '/' ] && rm -rf %{buildroot}
@@ -77,10 +87,11 @@ install -d %{buildroot}%{_datadir}
 
 install -m 755 xtrabackup %{buildroot}%{_bindir}
 install -m 755 xtrabackup_55 %{buildroot}%{_bindir}
+install -m 755 xtrabackup_56 %{buildroot}%{_bindir}
 install -m 755 innobackupex %{buildroot}%{_bindir}
 ln -s innobackupex %{buildroot}%{_bindir}/innobackupex-1.5.1
-install -m 755 xtrabackup_51 %{buildroot}%{_bindir}
 install -m 755 xbstream %{buildroot}%{_bindir}
+install -m 755 xbcrypt %{buildroot}%{_bindir}
 cp -R test %{buildroot}%{_datadir}/percona-xtrabackup-test
 
 %clean
@@ -91,9 +102,10 @@ cp -R test %{buildroot}%{_datadir}/percona-xtrabackup-test
 %{_bindir}/innobackupex
 %{_bindir}/innobackupex-1.5.1
 %{_bindir}/xtrabackup
-%{_bindir}/xtrabackup_51
 %{_bindir}/xtrabackup_55
+%{_bindir}/xtrabackup_56
 %{_bindir}/xbstream
+%{_bindir}/xbcrypt
 %doc COPYING
 
 %files -n percona-xtrabackup-test

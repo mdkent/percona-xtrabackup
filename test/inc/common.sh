@@ -27,25 +27,14 @@ function die()
   exit 1
 }
 
-function init_mysql_dir()
+function call_mysql_install_db()
 {
-    if [ ! -d "$MYSQLD_VARDIR" ]
-    then
-	vlog "Creating server root directory: $MYSQLD_VARDIR"
-	mkdir "$MYSQLD_VARDIR"
-    fi
-    if [ ! -d "$MYSQLD_TMPDIR" ]
-    then
-	vlog "Creating server temporary directory: $MYSQLD_TMPDIR"
-	mkdir "$MYSQLD_TMPDIR"
-    fi
-    if [ ! -d "$MYSQLD_DATADIR" ]
-    then
-	vlog "Creating server data directory: $MYSQLD_DATADIR"
-	mkdir -p "$MYSQLD_DATADIR"
 	vlog "Calling mysql_install_db"
-	$MYSQL_INSTALL_DB --no-defaults --basedir=$MYSQL_BASEDIR --datadir="$MYSQLD_DATADIR" --tmpdir="$MYSQLD_TMPDIR"
-    fi
+	cd $MYSQL_BASEDIR
+	$MYSQL_INSTALL_DB --defaults-file=${MYSQLD_VARDIR}/my.cnf \
+                    --basedir=${MYSQL_BASEDIR} \
+                    ${MYSQLD_EXTRA_ARGS}
+	cd -
 }
 
 ########################################################################
@@ -189,6 +178,7 @@ function init_server_variables()
     SRV_MYSQLD_DATADIR[$id]="$vardir/data"
     SRV_MYSQLD_TMPDIR[$id]="$vardir/tmp"
     SRV_MYSQLD_PIDFILE[$id]="${TEST_BASEDIR}/mysqld${id}.pid"
+    SRV_MYSQLD_ERRFILE[$id]="$vardir/data/mysqld${id}.err"
     SRV_MYSQLD_PORT[$id]=`get_free_port $id`
     SRV_MYSQLD_SOCKET[$id]=`mktemp -t xtrabackup.mysql.sock.XXXXXX`
 }
@@ -211,6 +201,7 @@ function reset_server_variables()
     SRV_MYSQLD_DATADIR[$id]=
     SRV_MYSQLD_TMPDIR[$id]=
     SRV_MYSQLD_PIDFILE[$id]=
+    SRV_MYSQLD_ERRFILE[$id]=
     SRV_MYSQLD_PORT[$id]=
     SRV_MYSQLD_SOCKET[$id]=
 }
@@ -227,23 +218,19 @@ function switch_server()
     MYSQLD_DATADIR="${SRV_MYSQLD_DATADIR[$id]}"
     MYSQLD_TMPDIR="${SRV_MYSQLD_TMPDIR[$id]}"
     MYSQLD_PIDFILE="${SRV_MYSQLD_PIDFILE[$id]}"
+    MYSQLD_ERRFILE="${SRV_MYSQLD_ERRFILE[$id]}"
     MYSQLD_PORT="${SRV_MYSQLD_PORT[$id]}"
     MYSQLD_SOCKET="${SRV_MYSQLD_SOCKET[$id]}"
 
-    MYSQL_ARGS="--no-defaults --socket=${MYSQLD_SOCKET} --user=root"
-    MYSQLD_ARGS="--no-defaults --basedir=${MYSQL_BASEDIR} \
---socket=${MYSQLD_SOCKET} --port=${MYSQLD_PORT} --server-id=$id \
---datadir=${MYSQLD_DATADIR} --tmpdir=${MYSQLD_TMPDIR} --log-bin=mysql-bin \
---relay-log=mysql-relay-bin --pid-file=${MYSQLD_PIDFILE} ${MYSQLD_EXTRA_ARGS}"
+    MYSQL_ARGS="--defaults-file=$MYSQLD_VARDIR/my.cnf "
+    MYSQLD_ARGS="--defaults-file=$MYSQLD_VARDIR/my.cnf ${MYSQLD_EXTRA_ARGS}"
     if [ "`whoami`" = "root" ]
     then
 	MYSQLD_ARGS="$MYSQLD_ARGS --user=root"
     fi
 
-    export MYSQL_HOME=$MYSQLD_VARDIR
-
-    IB_ARGS="--user=root --socket=${MYSQLD_SOCKET} --ibbackup=$XB_BIN"
-    XB_ARGS="--no-defaults"
+    IB_ARGS="--defaults-file=$MYSQLD_VARDIR/my.cnf --ibbackup=$XB_BIN"
+    XB_ARGS="--defaults-file=$MYSQLD_VARDIR/my.cnf"
 
     # Some aliases for compatibility, as tests use the following names
     topdir="$MYSQLD_VARDIR"
@@ -265,14 +252,49 @@ function start_server_with_id()
     init_server_variables $id
     switch_server $id
 
-    init_mysql_dir
+    if [ ! -d "$MYSQLD_VARDIR" ]
+    then
+	vlog "Creating server root directory: $MYSQLD_VARDIR"
+	mkdir "$MYSQLD_VARDIR"
+    fi
+    if [ ! -d "$MYSQLD_TMPDIR" ]
+    then
+	vlog "Creating server temporary directory: $MYSQLD_TMPDIR"
+	mkdir "$MYSQLD_TMPDIR"
+    fi
+
+    # Create the configuration file used by mysql_install_db, the server
+    # and the xtrabackup binary
     cat > ${MYSQLD_VARDIR}/my.cnf <<EOF
 [mysqld]
+socket=${MYSQLD_SOCKET}
+port=${MYSQLD_PORT}
+server-id=$id
+basedir=${MYSQL_BASEDIR}
 datadir=${MYSQLD_DATADIR}
 tmpdir=${MYSQLD_TMPDIR}
+log-error=${MYSQLD_ERRFILE}
+log-bin=mysql-bin
+relay-log=mysql-relay-bin
+pid-file=${MYSQLD_PIDFILE}
+replicate-ignore-db=mysql
+${MYSQLD_EXTRA_MY_CNF_OPTS:-}
+
+[client]
+socket=${MYSQLD_SOCKET}
+user=root
 EOF
 
+    # Create datadir and call mysql_install_db if it doesn't exist
+    if [ ! -d "$MYSQLD_DATADIR" ]
+    then
+	vlog "Creating server data directory: $MYSQLD_DATADIR"
+	mkdir -p "$MYSQLD_DATADIR"
+	call_mysql_install_db
+    fi
+
     # Start the server
+    echo "Starting ${MYSQLD} ${MYSQLD_ARGS} $* "
     ${MYSQLD} ${MYSQLD_ARGS} $* &
     if ! mysql_ping
     then
@@ -283,29 +305,27 @@ socket $MYSQLD_SOCKET"
 }
 
 ########################################################################
-# Stop server with the id specified as the first argument and additional
-# command line arguments (if specified)
+# Stop server with the id specified as the first argument.  The server 
+# is stopped in the fastest possible way.
 ########################################################################
 function stop_server_with_id()
 {
     local id=$1
     switch_server $id
 
-    vlog "Stopping server with id=$id..."
+    vlog "Killing server with id=$id..."
 
     if [ -f "${MYSQLD_PIDFILE}" ]
     then
-	${MYSQLADMIN} ${MYSQL_ARGS} --shutdown-timeout=60 shutdown
-	if [ -f "${MYSQLD_PIDFILE}" ]
-	then
-	    vlog "Could not stop the server with id=$id, using kill -9"
-	    kill -9 `cat ${MYSQLD_PIDFILE}`
-	    rm -f ${MYSQLD_PIDFILE}
-	fi
-	vlog "Server with id=$id has been stopped"
+        kill -9 `cat ${MYSQLD_PIDFILE}`
+        rm -f ${MYSQLD_PIDFILE}
     else
-	vlog "Server pid file '${MYSQLD_PIDFILE}' doesn't exist!"
+        vlog "Server PID file '${MYSQLD_PIDFILE}' doesn't exist!"
     fi
+
+    # Reset XB_ARGS so we can call xtrabackup in tests even without starting the
+    # server
+    XB_ARGS="--no-defaults"
 
     # unlock the port number
     free_reserved_port $MYSQLD_PORT
@@ -331,15 +351,25 @@ function stop_server()
 }
 
 ########################################################################
-# Stop all running servers
+# Shutdown server with id=1 cleanly
 ########################################################################
-function stop_all_servers()
+function shutdown_server()
 {
-    local id
-    for id in ${SRV_MYSQLD_IDS[*]}
-    do
-	stop_server_with_id ${SRV_MYSQLD_IDS[$id]}
-    done
+    switch_server 1
+
+    vlog "Shutting down server with id=1..."
+
+    if [ -f "${MYSQLD_PIDFILE}" ]
+    then
+        ${MYSQLADMIN} ${MYSQL_ARGS} shutdown
+    else
+        vlog "Server PID file '${MYSQLD_PIDFILE}' doesn't exist!"
+    fi
+
+    # unlock the port number
+    free_reserved_port $MYSQLD_PORT
+
+    reset_server_variables 1
 }
 
 ########################################################################
@@ -413,7 +443,26 @@ EOF
 ########################################################################
 function checksum_table()
 {
-    $MYSQL $MYSQL_ARGS -Ns -e "CHECKSUM TABLE $2" $1 | awk {'print $2'}
+    $MYSQL $MYSQL_ARGS -Ns -e "CHECKSUM TABLE $2 EXTENDED" $1 | awk {'print $2'}
+}
+
+##########################################################################
+# Dumps a given database using mysqldump                                 #
+##########################################################################
+function record_db_state()
+{
+    $MYSQLDUMP $MYSQL_ARGS -t --compact $1 >"$topdir/tmp/$1_old.sql"
+}
+
+
+##########################################################################
+# Compares the current dump of a given database with a state previously  #
+# captured with record_db_state().					 #
+##########################################################################
+function verify_db_state()
+{
+    $MYSQLDUMP $MYSQL_ARGS -t --compact $1 >"$topdir/tmp/$1_new.sql"
+    diff -u "$topdir/tmp/$1_old.sql" "$topdir/tmp/$1_new.sql"
 }
 
 ########################################################################
@@ -430,6 +479,63 @@ function egrep()
 {
     command egrep "$@" | cat
     return ${PIPESTATUS[0]}
+}
+
+readonly xb_performed_bmp_inc_backup="xtrabackup: using the full scan for incremental backup"
+readonly xb_performed_full_scan_inc_backup="xtrabackup: using the changed page bitmap"
+
+####################################################
+# Helper functions for testing incremental backups #
+####################################################
+function check_full_scan_inc_backup()
+{
+    if ! grep -q "$xb_performed_bmp_inc_backup" $OUTFILE ;
+    then
+        vlog "xtrabackup did not perform a full scan for the incremental backup."
+        exit -1
+    fi
+    if grep -q "$xb_performed_full_scan_inc_backup" $OUTFILE ;
+    then
+        vlog "xtrabackup appeared to use bitmaps instead of full scan for the incremental backup."
+        exit -1
+    fi
+}
+
+function check_bitmap_inc_backup()
+{
+    if ! grep -q "$xb_performed_full_scan_inc_backup" $OUTFILE ;
+    then
+        vlog "xtrabackup did not use bitmaps for the incremental backup."
+        exit -1
+    fi
+    if grep -q "$xb_performed_bmp_inc_backup" $OUTFILE ;
+    then
+        vlog "xtrabackup used a full scan instead of bitmaps for the incremental backup."
+        exit -1
+    fi
+}
+
+##############################################################
+# Helper functions for xtrabackup process suspend and resume #
+##############################################################
+function wait_for_xb_to_suspend()
+{
+    local file=$1
+    local i=0
+    echo "Waiting for $file to be created"
+    while [ ! -r $file ]
+    do
+        sleep 1
+        i=$((i+1))
+        echo "Waited $i seconds for xtrabackup_suspended to be created"
+    done
+}
+
+function resume_suspended_xb()
+{
+    local file=$1
+    echo "Removing $file"
+    rm -f $file
 }
 
 # To avoid unbound variable error when no server have been started

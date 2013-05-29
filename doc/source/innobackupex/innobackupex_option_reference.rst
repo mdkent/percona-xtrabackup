@@ -14,6 +14,10 @@ Options
 
    Prepare a backup in ``BACKUP-DIR`` by applying the transaction log file named :file:`xtrabackup_logfile` located in the same directory. Also, create new transaction logs. The InnoDB configuration is read from the file :file:`backup-my.cnf` created by |innobackupex| when the backup was made.
 
+.. option:: --compact
+
+   Create a compact backup with all secondary index pages omitted. This option is passed directly to xtrabackup.  See the :program:`xtrabackup` :doc:`documentation <../xtrabackup_bin/xtrabackup_binary>` for details.
+
 .. option:: --compress
 
    This option instructs xtrabackup to compress backup copies of InnoDB data files. It is passed directly to the xtrabackup child process. See the :program:`xtrabackup` :doc:`documentation <../xtrabackup_bin/xtrabackup_binary>` for details.
@@ -21,6 +25,10 @@ Options
 .. option::  --compress-threads
 
    This option specifies the number of worker threads that will be used for parallel compression. It is passed directly to the xtrabackup child process. See the :program:`xtrabackup` :doc:`documentation <../xtrabackup_bin/xtrabackup_binary>` for details.
+
+.. option:: --compress-chunk-size
+
+   This option specifies the size of the internal working buffer for each compression thread, measured in bytes. It is passed directly to the xtrabackup child process. See the :program:`xtrabackup` :doc:`documentation <../xtrabackup_bin/xtrabackup_binary>` for details.
 
 .. option:: --copy-back
 
@@ -40,7 +48,27 @@ Options
 
 .. option:: --defaults-group=GROUP-NAME
 
-   This option accepts a string argument that specifies the group which should be read from the configuration file. This is needed if you use mysqld_multi.
+   This option accepts a string argument that specifies the group which should be read from the configuration file. This is needed if you use mysqld_multi. This can also be used to indicate groups other than mysqld and xtrabackup.
+
+.. option:: --encrypt=ENCRYPTION_ALGORITHM
+
+   This option instructs xtrabackup to encrypt backup copies of InnoDB data files using the algorithm specified in the ENCRYPTION_ALGORITHM. It is passed directly to the xtrabackup child process. See the :program:`xtrabackup` :doc:`documentation <../xtrabackup_bin/xtrabackup_binary>` for more details.
+
+.. option:: --encrypt-key=ENCRYPTION_KEY
+
+   This option instructs xtrabackup to use the given ENCRYPTION_KEY when using the --encrypt option. It is passed directly to the xtrabackup child process. See the :program:`xtrabackup` :doc:`documentation <../xtrabackup_bin/xtrabackup_binary>` for more details.
+
+.. option:: --encrypt-key-file=ENCRYPTION_KEY_FILE
+
+   This option instructs xtrabackup to use the encryption key stored in the given ENCRYPTION_KEY_FILE when using the --encrypt option. It is passed directly to the xtrabackup child process. See the :program:`xtrabackup` :doc:`documentation <../xtrabackup_bin/xtrabackup_binary>` for more details.
+
+.. option:: --encrypt-threads
+
+   This option specifies the number of worker threads that will be used for parallel encryption. It is passed directly to the xtrabackup child process. See the :program:`xtrabackup` :doc:`documentation <../xtrabackup_bin/xtrabackup_binary>` for more details.
+
+.. option:: --encrypt-chunk-size 
+
+   This option specifies the size of the internal working buffer for each encryption thread, measured in bytes. It is passed directly to the xtrabackup child process. See the :program:`xtrabackup` :doc:`documentation <../xtrabackup_bin/xtrabackup_binary>` for more details.
 
 .. option:: --export
 
@@ -68,7 +96,7 @@ Options
 
 .. option:: --include=REGEXP
 
-   This option is a regular expression to be matched against table names in ``databasename.tablename`` format. It is passed directly to |xtrabackup|'s :option:`xtrabackup --tables` option. See the :program:`xtrabackup` documentation for details.
+   This option is a regular expression to be matched against table names in ``databasename.tablename`` format. It is passed directly to xtrabackup's :option:`xtrabackup --tables` option. See the :program:`xtrabackup` documentation for details.
 
 .. option:: --incremental
 
@@ -86,14 +114,18 @@ Options
 
    This option accepts a string argument that specifies the log sequence number (:term:`LSN`) to use for the incremental backup. It is used with the :option:`--incremental` option. It is used instead of specifying :option:`--incremental-basedir`. For databases created by *MySQL* and *Percona Server* 5.0-series versions, specify the as two 32-bit integers in high:low format. For databases created in 5.1 and later, specify the LSN as a single 64-bit integer.
 
+.. option:: --log-copy-interval
+
+   This option specifies time interval between checks done by log copying thread in milliseconds.
+
 .. option:: --move-back
 
     Move all the files in a previously made backup from the backup directory to their original locations. As this option removes backup files, it must be used with caution.
 
 .. option:: --no-lock
 
-   Use this option to disable table lock with ``FLUSH TABLES WITH READ LOCK``. Use it only if ALL your tables are InnoDB and you **DO NOT CARE** about the binary log position of the backup.
-   If you are considering to use :option:`--no-lock` because your backups are failing to acquire the lock, this could be because of incoming replication events preventing the lock from succeeding. Please try using :option:`--safe-slave-backup` to momentarily stop the replication slave thread, this may help the backup to succeed and you then don't need to resort to using :option:`--no-lock`
+   Use this option to disable table lock with ``FLUSH TABLES WITH READ LOCK``. Use this option to disable table lock with ``FLUSH TABLES WITH READ LOCK``. Use it only if ALL your tables are InnoDB and you **DO NOT CARE** about the binary log position of the backup. This option shouldn't be used if there are any ``DDL`` statements being executed or if any updates are happening on non-InnoDB tables (this includes the system MyISAM tables in the *mysql* database), otherwise it could lead to an inconsistent backup. 
+   If you are considering to use :option:`--no-lock` because your backups are failing to acquire the lock, this could be because of incoming replication events preventing the lock from succeeding. Please try using :option:`--safe-slave-backup` to momentarily stop the replication slave thread, this may help the backup to succeed and you then don't need to resort to using this option.
 
 .. option:: --no-timestamp
 
@@ -101,7 +133,7 @@ Options
 
 .. option:: --parallel=NUMBER-OF-THREADS
 
-   This option accepts an integer argument that specifies the number of threads the :program:`xtrabackup` child process should use to back up files concurrently.  Note that this option works on file level, that is, if you have several .ibd files, they will be copied in parallel. If you have just single big .ibd file, it will have no effect. It is passed directly to xtrabackup's :option:`xtrabackup --parallel` option. See the :program:`xtrabackup` documentation for details
+   This option accepts an integer argument that specifies the number of threads the :program:`xtrabackup` child process should use to back up files concurrently.  Note that this option works on file level, that is, if you have several .ibd files, they will be copied in parallel. If your tables are stored together in a single tablespace file, it will have no effect. It is passed directly to xtrabackup's :option:`xtrabackup --parallel` option. See the :program:`xtrabackup` documentation for details
 
 .. option:: --password=PASSWORD
 
@@ -111,17 +143,21 @@ Options
 
    This option accepts a string argument that specifies the port to use when connecting to the database server with TCP/IP. It is passed to the :command:`mysql` child process. It is passed to the :command:`mysql` child process without alteration. See :command:`mysql --help` for details.
 
+.. option:: --rebuild-indexes
+
+   This option only has effect when used together with the --apply-log option and is passed directly to xtrabackup. When used, makes xtrabackup rebuild all secondary indexes after applying the log. This option is normally used to prepare compact backups. See the :program:`xtrabackup` documentation for more information.
+
+.. option:: --rebuild-threads=NUMBER-OF-THREADS
+
+   This option only has effect when used together with the --apply-log and --rebuild-indexes option and is passed directly to xtrabackup. When used, xtrabackup processes tablespaces in parallel with the specified number of threads when rebuilding indexes. See the :program:`xtrabackup` documentation for more information.
+
 .. option:: --redo-only
 
-   This option is passed directly to xtrabackup's :option:`xtrabackup --apply-log-only` option. This forces :program:`xtrabackup` to skip the "rollback" phase and do a "redo" only. This is necessary if the backup will have incremental changes applied to it later. See the |xtrabackup| :doc:`documentation <../xtrabackup_bin/incremental_backups>` for details.
-
-.. option:: --remote-host=HOSTNAME
-
-   This option accepts a string argument that specifies the remote host on which the backup files will be created, by using an ssh connection. This option is DEPRECATED and will be removed in Percona XtraBackup 2.1. In Percona XtraBackup 2.0 and later, you should use streaming backups instead.
+   This option should be used when preparing the base full backup and when merging all incrementals except the last one. It is passed directly to xtrabackup's :option:`xtrabackup --apply-log-only` option. This forces :program:`xtrabackup` to skip the "rollback" phase and do a "redo" only. This is necessary if the backup will have incremental changes applied to it later. See the |xtrabackup| :doc:`documentation <../xtrabackup_bin/incremental_backups>` for details.
 
 .. option:: --rsync
 
-   Uses the :program:`rsync` utility to optimize local file transfers. When this option is specified, :program:`innobackupex` uses :program:`rsync` to copy all non-InnoDB files instead of spawning a separate :program:`cp` for each file, which can be much faster for servers with a large number of databases or tables.  This option cannot be used together with :option:`--remote-host` or :option:`--stream`.
+   Uses the :program:`rsync` utility to optimize local file transfers. When this option is specified, :program:`innobackupex` uses :program:`rsync` to copy all non-InnoDB files instead of spawning a separate :program:`cp` for each file, which can be much faster for servers with a large number of databases or tables.  This option cannot be used together with :option:`--stream`.
 
 .. option:: --safe-slave-backup
 
@@ -135,10 +171,6 @@ Options
 
    This option accepts a string argument that specifies the command line options to pass to :command:`scp` when the option :option:`--remost-host` is specified. If the option is not specified, the default options are ``-Cp -c arcfour``.
 
-.. option:: --sshopt = SSH-OPTIONS
-
-   This option accepts a string argument that specifies the command line options to pass to :command:`ssh` when the option :option:`--remost-host` is specified.
-
 .. option:: --slave-info
 
    This option is useful when backing up a replication slave server. It prints the binary log position and name of the master server. It also writes this information to the :file:`xtrabackup_slave_info` file as a ``CHANGE MASTER`` command. A new slave for this master can be set up by starting a slave server on this backup and issuing a ``CHANGE MASTER`` command with the binary log position saved in the :file:`xtrabackup_slave_info` file.
@@ -146,6 +178,10 @@ Options
 .. option:: --socket
 
    This option accepts a string argument that specifies the socket to use when connecting to the local database server with a UNIX domain socket. It is passed to the mysql child process without alteration. See :command:`mysql --help` for details.
+
+.. option:: --sshopt = SSH-OPTIONS
+
+   This option accepts a string argument that specifies the command line options to pass to :command:`ssh` when the option :option:`--remost-host` is specified.
 
 .. option:: --stream=STREAMNAME
 
@@ -161,11 +197,11 @@ Options
 
 .. option:: --tmpdir=DIRECTORY
 
-   This option accepts a string argument that specifies the location where a temporary file will be stored. It should be used when :option:`--remote-host` or :option:`--stream` is specified. For these options, the transaction log will first be stored to a temporary file, before streaming or copying to a remote host. This option specifies the location where that temporary file will be stored. If the option is not specifed, the default is to use the value of ``tmpdir`` read from the server configuration.
+   This option accepts a string argument that specifies the location where a temporary file will be stored. It may be used when :option:`--stream` is specified. For these options, the transaction log will first be stored to a temporary file, before streaming or copying to a remote host. This option specifies the location where that temporary file will be stored. If the option is not specified, the default is to use the value of ``tmpdir`` read from the server configuration. innobackupex is passing the tmpdir value specified in my.cnf as the --target-dir option to the xtrabackup binary. Both [mysqld] and [xtrabackup] groups are read from my.cnf. If there is tmpdir in both, then the value being used depends on the order of those group in my.cnf.
 
 .. option:: --use-memory
 
-   This option accepts a string argument that specifies the amount of memory in bytes for :program:`xtrabackup` to use for crash recovery while preparing a backup. Multiples are supported providing the unit (e.g. 1MB, 1GB). It is used only with the option :option:`--apply-log`. It is passed directly to |xtrabackup| 's :option:`xtrabackup --use-memory` option. See the |xtrabackup| documentation for details.
+   This option accepts a string argument that specifies the amount of memory in bytes for :program:`xtrabackup` to use for crash recovery while preparing a backup. Multiples are supported providing the unit (e.g. 1MB, 1M, 1GB, 1G). It is used only with the option :option:`--apply-log`. It is passed directly to xtrabackup's :option:`xtrabackup --use-memory` option. See the |xtrabackup| documentation for details.
 
 .. option:: --user=USER
 

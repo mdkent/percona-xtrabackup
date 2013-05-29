@@ -4,31 +4,74 @@ set -e
 
 MYSQL_51_VERSION=5.1.59
 MYSQL_55_VERSION=5.5.17
+MYSQL_56_VERSION=5.6.10
 PS_51_VERSION=5.1.59-13.0
 PS_55_VERSION=5.5.16-22.0
 
 AUTO_DOWNLOAD=${AUTO_DOWNLOAD:-no}
 MASTER_SITE="http://s3.amazonaws.com/percona.com/downloads/community"
 
+top_dir=`pwd`
+
+# Set the build type and resolve synonyms
+case "$1" in
+"plugin" )
+        type="innodb51"
+        ;;
+"5.5" )
+        type="innodb55"
+        ;;
+"5.6" | "xtradb56" | "mariadb100" )
+        type="innodb56"
+        ;;
+"xtradb" | "mariadb51" | "mariadb52" | "mariadb53" )
+        type="xtradb51"
+        ;;
+"galera55" | "mariadb55" )
+        type="xtradb55"
+        ;;
+*)
+        type=$1
+        ;;
+esac
+
 # Percona Server 5.5 does not build with -Werror, so ignore DEBUG for now
-if [ -n "$DEBUG" -a "$1" != "galera55" -a "$1" != "xtradb55" -a "$1" != "xtradb51" -a "$1" != "xtradb" ]
+if [ -n "$DEBUG" -a "$type" != "xtradb55" -a "$type" != "xtradb51" ]
 then
     # InnoDB extra debug flags
-    innodb_extra_debug="-DUNIV_DEBUG -DUNIV_SYNC_DEBUG -DUNIV_MEM_DEBUG \
+    innodb_extra_debug="-DUNIV_DEBUG -DUNIV_MEM_DEBUG \
 -DUNIV_DEBUG_THREAD_CREATION -DUNIV_DEBUG_LOCK_VALIDATE -DUNIV_DEBUG_PRINT \
 -DUNIV_DEBUG_FILE_ACCESS -DUNIV_SEARCH_DEBUG -DUNIV_LOG_LSN_DEBUG \
 -DUNIV_ZIP_DEBUG -DUNIV_AHI_DEBUG -DUNIV_SQL_DEBUG -DUNIV_AIO_DEBUG \
--DUNIV_LRU_DEBUG -DUNIV_BUF_DEBUG -DUNIV_HASH_DEBUG -DUNIV_LIST_DEBUG -DUNIV_IBUF_DEBUG"
-    export CFLAGS="$CFLAGS -g -O0 $innodb_extra_debug -DSAFE_MUTEX -DSAFEMALLOC"
-    export CXXFLAGS="$CXXFLAGS -g -O0 $innodb_extra_debug -DSAFE_MUTEX -DSAFEMALLOC"
+-DUNIV_LRU_DEBUG -DUNIV_BUF_DEBUG -DUNIV_HASH_DEBUG -DUNIV_IBUF_DEBUG"
+
+    if [ "$type" = "innodb56" ]
+    then
+	innodb_extra_debug="$innodb_extra_debug -DUNIV_LIST_DEBUG"
+    fi
+
+    CFLAGS="$CFLAGS -g -O0 $innodb_extra_debug -DSAFE_MUTEX -DSAFEMALLOC"
+    CXXFLAGS="$CXXFLAGS -g -O0 $innodb_extra_debug -DSAFE_MUTEX -DSAFEMALLOC"
     extra_config_51="--with-debug=full"
-    extra_config_55="-DWITH_DEBUG=ON"
+    extra_config_55plus="-DWITH_DEBUG=ON -DMYSQL_MAINTAINER_MODE=OFF"
 else
-    export CFLAGS="$CFLAGS -g -O3"
-    export CXXFLAGS="$CXXFLAGS -g -O3"
+    CFLAGS="$CFLAGS -g -O3"
+    CXXFLAGS="$CXXFLAGS -g -O3"
     extra_config_51=
-    extra_config_55=
+    extra_config_55plus=
 fi
+
+if [ "$type" = "innodb51_builtin" ]
+then
+    # include/*.ic in pre-5.1-plugin InnoDB do not compile well in C++.
+    CXXFLAGS="$CXXFLAGS -fpermissive"
+fi
+
+xtrabackup_include_dir="$top_dir/src"
+CFLAGS="$CFLAGS -I$xtrabackup_include_dir"
+CXXFLAGS="$CXXFLAGS -I$xtrabackup_include_dir"
+
+export CFLAGS CXXFLAGS
 
 MAKE_CMD=make
 if gmake --version > /dev/null 2>&1
@@ -43,14 +86,13 @@ function usage()
     echo
     echo "Usage: `basename $0` CODEBASE"
     echo "where CODEBASE can be one of the following values or aliases:"
-    echo "  innodb50         | 5.0                   build against innodb 5.1 builtin, but should be compatible with MySQL 5.0"
-    echo "  innodb51_builtin | 5.1                   build against built-in InnoDB in MySQL 5.1"
-    echo "  innodb51         | plugin                build agsinst InnoDB plugin in MySQL 5.1"
+    echo "  innodb51         | plugin                build against InnoDB plugin in MySQL 5.1"
     echo "  innodb55         | 5.5                   build against InnoDB in MySQL 5.5"
+    echo "  innodb56         | 5.6,xtradb56,         build against InnoDB in MySQL 5.6"
+    echo "                   | mariadb100"
     echo "  xtradb51         | xtradb,mariadb51      build against Percona Server with XtraDB 5.1"
     echo "                   | mariadb52,mariadb53"
-    echo "  xtradb55         | xtradb55,galera55,    build against Percona Server with XtraDB 5.5"
-    echo "                   | mariadb55"
+    echo "  xtradb55         | galera55,mariadb55    build against Percona Server with XtraDB 5.5"
     exit -1
 }
 
@@ -101,14 +143,20 @@ function make_dirs()
 
 function build_server()
 {
+    local $type=$1
     echo "Configuring the server"
     cd $server_dir
     BUILD/autorun.sh
     eval $configure_cmd
 
     echo "Building the server"
-    make_dirs include zlib strings mysys dbug extra
-    make_dirs $innodb_dir
+    if [ "$type" = "innodb56" ]
+    then
+        make_dirs libmysqld
+    else
+        make_dirs include zlib strings mysys dbug extra
+        make_dirs $innodb_dir
+    fi
     cd $top_dir
 }
 
@@ -139,6 +187,13 @@ function build_xtrabackup()
 	export LIBS="$LIBS -lrt"
     fi
     $MAKE_CMD MYSQL_ROOT_DIR=$server_dir clean
+    cat > build.sh <<EOF
+export CFLAGS="$CFLAGS"
+export CXXFLAGS="$CXXFLAGS"
+$MAKE_CMD MYSQL_ROOT_DIR=$server_dir \
+  XTRABACKUP_VERSION=$XTRABACKUP_VERSION $xtrabackup_target
+EOF
+    chmod +x build.sh
     $MAKE_CMD MYSQL_ROOT_DIR=$server_dir XTRABACKUP_VERSION=$XTRABACKUP_VERSION $xtrabackup_target
     cd $top_dir
 }
@@ -157,6 +212,7 @@ function build_xtrabackup()
 ################################################################################
 function build_all()
 {
+    local type=$1
     local mysql_version_short=${mysql_version:0:3}
     server_dir=$top_dir/mysql-$mysql_version_short
     server_tarball=mysql-$mysql_version.tar.gz
@@ -171,38 +227,19 @@ function build_all()
     unpack_and_patch $server_tarball $server_patch
     mv $top_dir/mysql-$mysql_version $server_dir
 
-    build_server
+    build_server $type
 
     build_xtrabackup
 }
 
-if ! test -f src/xtrabackup.c
+if ! test -f src/xtrabackup.cc
 then
 	echo "`basename $0` must be run from the directory with XtraBackup sources"
 	usage
 fi
 
-type=$1
-top_dir=`pwd`
-
-
 case "$type" in
-"innodb51_builtin" | "5.1" | "innodb50" | "5.0")
-	mysql_version=$MYSQL_51_VERSION
-	server_patch=innodb51_builtin.patch
-	innodb_name=innobase
-	xtrabackup_target=5.1
-	configure_cmd="./configure --enable-local-infile \
-	    --enable-thread-safe-client \
-	    --with-plugins=innobase \
-	    --with-zlib-dir=bundled \
-	    --enable-shared \
-	    --with-extra-charsets=all $extra_config_51"
-
-	build_all
-	;;
-
-"innodb51" | "plugin")
+"innodb51")
        mysql_version=$MYSQL_51_VERSION
        server_patch=innodb51.patch
        innodb_name=innodb_plugin
@@ -214,9 +251,9 @@ case "$type" in
            --enable-shared \
            --with-extra-charsets=all $extra_config_51"
 
-       build_all
+       build_all $type
        ;;
-"innodb55" | "5.5")
+"innodb55")
 	mysql_version=$MYSQL_55_VERSION
 	server_patch=innodb55.patch
 	innodb_name=innobase
@@ -228,12 +265,26 @@ case "$type" in
 		-DWITH_PARTITION_STORAGE_ENGINE=ON \
 		-DWITH_ZLIB=bundled \
 		-DWITH_EXTRA_CHARSETS=all \
-		-DENABLE_DTRACE=OFF $extra_config_55"
+		-DENABLE_DTRACE=OFF $extra_config_55plus"
 
-	build_all
+	build_all $type
 	;;
 
-"xtradb51" | "xtradb" | "mariadb51" | "mariadb52" | "mariadb53")
+"innodb56" )
+        mysql_version=$MYSQL_56_VERSION
+        server_patch=innodb56.patch
+        innodb_name=innobase
+        xtrabackup_target=5.6
+        configure_cmd="cmake . \
+                -DWITH_INNOBASE_STORAGE_ENGINE=ON \
+                -DWITH_ZLIB=bundled \
+                -DWITH_EXTRA_CHARSETS=all \
+                -DWITH_EMBEDDED_SERVER=1 \
+                -DENABLE_DTRACE=OFF $extra_config_55plus"
+        build_all $type
+        ;;
+
+"xtradb51" )
 	server_dir=$top_dir/Percona-Server
 	branch_dir=percona-server-5.1-xtrabackup
 	innodb_dir=$server_dir/storage/innodb_plugin
@@ -279,12 +330,12 @@ case "$type" in
 	cd $server_dir
 	patch -p1 < $top_dir/patches/xtradb51.patch
 
-	build_server
+	build_server $type
 
 	build_xtrabackup
 
 	;;
-"xtradb55" | "galera55" | "mariadb55")
+"xtradb55" )
 	server_dir=$top_dir/Percona-Server-5.5
 	branch_dir=percona-server-5.5-xtrabackup
 	innodb_dir=$server_dir/storage/innobase
@@ -296,7 +347,7 @@ case "$type" in
 		-DWITH_PARTITION_STORAGE_ENGINE=ON \
 		-DWITH_ZLIB=bundled \
 		-DWITH_EXTRA_CHARSETS=all \
-		-DENABLE_DTRACE=OFF $extra_config_55"
+		-DENABLE_DTRACE=OFF $extra_config_55plus"
 	if [ "`uname -s`" = "Linux" ]
 	then
 		configure_cmd="LIBS=-lrt $configure_cmd"
@@ -333,7 +384,7 @@ case "$type" in
 	cd $server_dir
 	patch -p1 < $top_dir/patches/xtradb55.patch
 
-	build_server
+	build_server $type
 
 	build_xtrabackup
 

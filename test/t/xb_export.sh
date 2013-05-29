@@ -1,15 +1,21 @@
 . inc/common.sh
 
-if [ -z "$XTRADB_VERSION" ]; then
-    echo "Requires XtraDB" > $SKIPPED_REASON
+if [ -z "$XTRADB_VERSION" -a ${MYSQL_VERSION:0:3} != "5.6" ]; then
+    echo "Requires XtraDB or MySQL 5.6" > $SKIPPED_REASON
     exit $SKIPPED_EXIT_CODE
 fi
 
-if [ ${MYSQL_VERSION:0:3} = "5.5" ]
+import_option=""
+
+if [ ! -z "$XTRADB_VERSION" ]
 then
-    import_option="--innodb_import_table_from_xtrabackup=1"
-else
-    import_option="--innodb_expand_import=1"
+    # additional agrument should be passed to XtraDB
+    if [ ${MYSQL_VERSION:0:3} = "5.5" ]
+    then
+        import_option="--innodb_import_table_from_xtrabackup=1"
+    else
+        import_option="--innodb_expand_import=1"
+    fi
 fi
 
 mysql_extra_args="--innodb_file_per_table $import_option \
@@ -54,14 +60,6 @@ vlog "Database was re-initialized"
 
 run_cmd ${MYSQL} ${MYSQL_ARGS} -e "alter table test discard tablespace;" incremental_sample
 
-# Test the with innodb_file_per_table=0 --export bails out with an error
-# (bug #758888)
-
-run_cmd_expect_failure $XB_BIN $XB_ARGS --datadir=$mysql_datadir --prepare \
-    --export --target-dir=$backup_dir --innodb-file-per-table=0
-
-XB_ARGS="$XB_ARGS --innodb-file-per-table=1"
-
 xtrabackup --datadir=$mysql_datadir --prepare --export \
     --target-dir=$backup_dir
 
@@ -88,7 +86,7 @@ vlog "Checksums are OK"
 # consistent backup results. Otherwise we risk ending up with no test.ibd
 # in the backup in case importing has not finished before taking backup
 
-stop_server
+shutdown_server
 start_server $mysql_extra_args
 
 # Some testing queries

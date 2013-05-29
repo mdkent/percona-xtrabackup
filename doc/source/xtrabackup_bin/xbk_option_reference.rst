@@ -9,22 +9,6 @@ This page documents all of the command-line options for the :program:`xtrabackup
 Options
 =======
 
-.. option:: --print-defaults
-
-   Print the program argument list and exit. Must be given as the first option on the command-line.
-
-.. option:: --no-defaults
-
-   Don't read default options from any option file. Must be given as the first option on the command-line.
-
-.. option:: --defaults-file=#
-
-   Only read default options from the given file. Must be given as the first option on the command-line. Must be a real file; it cannot be a symbolic link.
-
-.. option:: --defaults-extra-file=#
-
-   Read this file after the global files are read. Must be given as the first option on the command-line.
-
 .. option:: --apply-log-only
 
    This option causes only the redo stage to be performed when preparing a backup. It is very important for incremental backups.
@@ -33,13 +17,17 @@ Options
 
    Make a backup and place it in :option:`--target-dir`. See :doc:`Creating a backup <creating_a_backup>`.
 
+.. option::  --compact     
+
+   Create a compact backup by skipping secondary index pages.
+
 .. option:: --compress 
 
    This option tells |xtrabackup| to compress all output data, including the transaction log file and meta data files, using the specified compression algorithm. The only currently supported algorithm is 'quicklz'. The resulting files have the qpress archive format, i.e. every `*.qp` file produced by xtrabackup is essentially a one-file qpress archive and can be extracted and uncompressed by the `qpress <http://www.quicklz.com/>`_  file archiver.
 
 .. option:: --compress-threads 
 
-   This option specifies the number of worker threads used by |xtrabackup| for parallel data compression. This option defaults to 1. Parallel compression ('--compress-threads') can be used together with parallel file copying ('--parallel'). For example, '--parallel=4 --compress --compress-threads=2' will create 4 IO threads that will read the data and pipe it to 2 compression threads. New algorithms (gzip, bzip2, etc.) may be added later with minor efforts.
+   This option specifies the number of worker threads used by |xtrabackup| for parallel data compression. This option defaults to 1. Parallel compression ('--compress-threads') can be used together with parallel file copying ('--parallel'). For example, '--parallel=4 --compress --compress-threads=2' will create 4 IO threads that will read the data and pipe it to 2 compression threads. 
 
 .. option:: --create-ib-logfile
 
@@ -48,6 +36,18 @@ Options
 .. option:: --datadir
 
    The source directory for the backup. This should be the same as the datadir for your MySQL server, so it should be read from :file:`my.cnf` if that exists; otherwise you must specify it on the command line.
+
+.. option:: --defaults-extra-file=#
+
+   Read this file after the global files are read. Must be given as the first option on the command-line.
+
+.. option:: --defaults-file=#
+
+   Only read default options from the given file. Must be given as the first option on the command-line. Must be a real file; it cannot be a symbolic link.
+
+.. option:: --defaults-group
+
+   This option is to set the group which should be read from the configuration file. This is used by innobackupex if you use the `--defaults-group` option. It is needed for mysqld_multi deployments.
 
 .. option:: --export
 
@@ -64,6 +64,10 @@ Options
 .. option:: --incremental-dir
 
    When preparing an incremental backup, this is the directory where the incremental backup is combined with the full backup to make a new full backup.
+
+.. option:: --incremental-force-scan
+
+   When creating an incremental backup, force a full scan of the data pages in the instance being backuped even if the complete changed page bitmap data is available.
 
 .. option:: --incremental-lsn=name
 
@@ -101,41 +105,61 @@ Options
     --innodb-read-io-threads
     --innodb-write-io-threads
 
-.. option:: --defaults-group
+.. option:: --log-copy-interval
 
-   This option is to set the group which should be read from the configuration file. This is used by innobackupex if you use the `--defaults-group` option. It is needed for mysqld_multi deployments.
+   This option specifies time interval between checks done by log copying thread in milliseconds (default is 1 second).
 
 .. option:: --log-stream
 
    Makes xtrabackup not copy data files, and output the contents of the InnoDB log files to STDOUT until the :option:`--suspend-at-end` file is deleted. This option enables :option:`--suspend-at-end` automatically.
 
-.. option:: --stream=name 
+.. option:: --no-defaults
 
-   Stream all backup files to the standard output in the specified format. Currently supported formats are 'xbstream' and 'tar'.
+   Don't read default options from any option file. Must be given as the first option on the command-line.
+
+.. option:: --parallel=#
+
+   This option specifies the number of threads to use to copy multiple data files concurrently when creating a backup. The default value is 1 (i.e., no concurrent transfer).
 
 .. option:: --prepare
 
    Makes :program:`xtrabackup` perform recovery on a backup created with :option:`--backup`, so that it is ready to use. See :doc:`preparing a backup <preparing_the_backup>`.
 
+.. option:: --print-defaults
+
+   Print the program argument list and exit. Must be given as the first option on the command-line.
+
 .. option:: --print-param
 
    Makes :program:`xtrabackup` print out parameters that can be used for copying the data files back to their original locations to restore them. See :ref:`scripting-xtrabackup`.
+
+.. option:: --rebuild_indexes
+
+   Rebuild secondary indexes in InnoDB tables after applying the log. Only has effect with --prepare. 
+
+.. option::  --rebuild_threads=# 
+
+   Use this number of threads to rebuild indexes in a compact backup. Only has effect with --prepare and --rebuild-indexes.
 
 .. option:: --stats
 
    Causes :program:`xtrabackup` to scan the specified data files and print out index statistics.
 
+.. option:: --stream=name 
+
+   Stream all backup files to the standard output in the specified format. Currently supported formats are 'xbstream' and 'tar'.
+
 .. option:: --suspend-at-end
 
    Causes :program:`xtrabackup` to create a file called :file:`xtrabackup_suspended` in the :option:`--target-dir`. Instead of exiting after copying data files, :program:`xtrabackup` continues to copy the log file, and waits until the :file:`xtrabackup_suspended` file is deleted. This enables xtrabackup and other programs to coordinate their work. See :ref:`scripting-xtrabackup`.
 
-.. option:: --tables-file=name
-
-   A file containing one table name per line, in databasename.tablename format. The backup will be limited to the specified tables. See :ref:`scripting-xtrabackup`.
-
 .. option:: --tables=name
 
    A regular expression against which the full tablename, in ``databasename.tablename`` format, is matched. If the name matches, the table is backed up. See :doc:`partial backups <partial_backups>`.
+
+.. option:: --tables-file=name
+
+   A file containing one table name per line, in databasename.tablename format. The backup will be limited to the specified tables. See :ref:`scripting-xtrabackup`.
 
 .. option:: --target-dir=name
 
@@ -154,10 +178,6 @@ Options
 .. option:: --use-memory=#
 
    This option affects how much memory is allocated for preparing a backup with :option:`--prepare`, or analyzing statistics with :option:`--stats`. Its purpose is similar to :term:`innodb_buffer_pool_size`. It does not do the same thing as the similarly named option in Oracle's InnoDB Hot Backup tool. The default value is 100MB, and if you have enough available memory, 1GB to 2GB is a good recommended value.
-
-.. option:: --parallel=#
-
-   This option specifies the number of threads to use to copy multiple data files concurrently when creating a backup. The default value is 1 (i.e., no concurrent transfer).
 
 .. option:: --version
 
