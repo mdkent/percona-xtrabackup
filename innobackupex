@@ -1941,13 +1941,9 @@ sub write_extra_file {
     print STDERR "$prefix Copying extra file $src to $dst\n";
 
     # write binlog info file
-    if (!$option_remote_host) {
-        open(FILE, ">$dst") || 
-            Die "Failed to open file '$dst': $!";
-    } else {
-        open(FILE, "| ssh $option_ssh_opt $option_remote_host 'cat > $dst'") ||
-            Die "Failed to open file '$option_remote_host:$dst': $!";
-    }
+    open(FILE, ">$dst") || 
+         Die "Failed to open file '$dst': $!";
+
     copy($src, \*FILE);
     close(FILE);
 
@@ -1957,9 +1953,8 @@ sub write_extra_file {
 
         print STDERR "$prefix Streaming extra file $filename_name\n";
 
-	system("cd $filename_dir; $stream_cmd $filename_name")
-	  and Die "Failed to stream '$filename_name': $!";
-
+        stream_encrypt_file($filename_dir, $filename_name)
+                            and Die "Failed to stream '$filename_name': $!";
         unlink $dst || Die "Failed to delete '$dst': $!";
     }
 }
