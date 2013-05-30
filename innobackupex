@@ -1616,17 +1616,7 @@ sub write_backup_info {
     my @lines;
     my @info_lines;
     my $cmdline;
-    my $mysql_version = '';
     my $xtrabackup_version = '';
-
-    # grab version from running mysql
-    mysql_send 'SELECT VERSION() as Version\G';
-
-    # parse it
-    file_to_array($mysql_stdout, \@lines);
-    for (@lines) {
-        $mysql_version = $1 if /Version:\s*(\S*)\s*$/;
-    }
 
     # grab version from xtrabackup
     $cmdline = "$option_ibbackup_binary -v 2>&1";
@@ -1641,7 +1631,7 @@ sub write_backup_info {
     open(FILE, ">$backup_info") || 
         Die "Failed to open file '$backup_info': $!";
 
-    print FILE "mysql_version = $mysql_version\n";
+    print FILE "mysql_server_version = $mysql_server_version\n";
     print FILE "xtrabackup_version = $xtrabackup_version\n";
     print FILE "innobackup_version = $innobackup_version\n";
     close(FILE);
