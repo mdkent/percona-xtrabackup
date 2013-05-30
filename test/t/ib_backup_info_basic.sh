@@ -9,7 +9,7 @@ start_server
 # take a backup with stream mode
 innobackupex --no-timestamp $topdir/backup
 
-mysql_version=`${MYSQL} ${MYSQL_ARGS} -Ns -e "select version()"`
+mysql_server_version=`${MYSQL} ${MYSQL_ARGS} -Ns -e "select version()"`
 xtrabackup_version=`xtrabackup -v 2>&1 | cut -d" " -f3`
 
 if [ -f $topdir/backup/xtrabackup_backup_info ] ; then
@@ -19,10 +19,10 @@ else
     exit -1
 fi
 
-if grep "$mysql_version" $topdir/backup/xtrabackup_backup_info; then
-    vlog "found $mysql_version in xtrabackup_backup_info"
+if grep "$mysql_server_version" $topdir/backup/xtrabackup_backup_info; then
+    vlog "found $mysql_server_version in xtrabackup_backup_info"
 else
-    vlog "couldn't find $mysql_version in xtrabackup_backup_info"
+    vlog "couldn't find $mysql_server_version in xtrabackup_backup_info"
     exit -1
 fi  
 
