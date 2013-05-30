@@ -3306,21 +3306,17 @@ sub write_backup_info {
     }
 
     # print collected version info to a file
-    if (!$option_remote_host) {
-        open(FILE, ">$backup_info") || 
-            Die "Failed to open file '$backup_info': $!";
-    } else {
-        open(FILE, "| ssh $option_ssh_opt $option_remote_host 'cat > $backup_info'") ||
-            Die "Failed to open file '$option_remote_host:$backup_info': $!";
-    }
+    open(FILE, ">$backup_info") || 
+        Die "Failed to open file '$backup_info': $!";
+
     print FILE "mysql_version = $mysql_version\n";
     print FILE "xtrabackup_version = $xtrabackup_version\n";
     print FILE "innobackup_version = $innobackup_version\n";
     close(FILE);
 
     if ($option_stream) {
-        system("cd $option_tmpdir; $stream_cmd xtrabackup_backup_info")
-            and Die "Failed to stream 'xtrabackup_backup_info': $!";
+        stream_encrypt_file($option_tmpdir, 'xtrabackup_backup_info')
+                            and Die "Failed to stream 'xtrabackup_backup_info': $!";
         unlink $backup_info || Die "Failed to delete '$backup_info': $!";
     }
 }
