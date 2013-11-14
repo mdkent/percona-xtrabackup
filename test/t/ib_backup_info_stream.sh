@@ -10,7 +10,7 @@ start_server
 mkdir -p $topdir/backup
 innobackupex --stream=tar $topdir/backup > $topdir/backup/stream.tar
 
-if $TAR itf $topdir/backup/stream.tar | grep ^xtrabackup_backup_info; then
+if $TAR itf $topdir/backup/stream.tar | grep ^./xtrabackup_backup_info; then
     vlog "xtrabackup_backup_info was backed up"
 else
     vlog "xtrabackup_backup_info was not backed up"
