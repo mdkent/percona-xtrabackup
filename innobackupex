@@ -147,6 +147,8 @@ my $option_version_check = '';
 my %mysql;
 my $option_backup = '';
 
+my @option_extra_file;
+
 # name of the my.cnf configuration file
 #my $config_file = '';
 
@@ -164,6 +166,9 @@ my $innodb_log_group_home_dir = '';
 
 # backup my.cnf file
 my $backup_config_file = '';
+
+# extra files to include in the backup
+my @backup_extra_files;
 
 # whether slave SQL thread is running when wait_for_safe_slave() is called
 my $sql_thread_started = 0;
@@ -3542,6 +3547,16 @@ sub init {
         $galera_info = $work_dir . '/xtrabackup_galera_info';
         $slave_info = $work_dir . '/xtrabackup_slave_info';
         $backup_info = $work_dir . '/xtrabackup_backup_info';
+
+        # Copy in arbitrary files into the backup
+        foreach my $extra_file (@option_extra_file) {
+            my $src_path = dirname($extra_file);
+            my $src_file = basename($extra_file);
+            my $dst_file = $work_dir . '/' . basename($extra_file);
+
+            backup_file($src_path, $src_file, $dst_file);
+        }
+
         write_backup_config_file($backup_config_file);
 
         foreach (@xb_suspend_files) {
@@ -3612,7 +3627,6 @@ sub write_backup_config_file {
 
     write_to_backup_file("$filename", "$options_dump");
 }
-
 
 #
 # check_args subroutine checks command line arguments. If there is a problem,
@@ -3698,7 +3712,8 @@ sub check_args {
                         'lock-wait-threshold=i' => \$option_lock_wait_threshold,
                         'lock-wait-query-type=s' =>
                         \$option_lock_wait_query_type,
-                        'version-check' => \$option_version_check
+                        'version-check' => \$option_version_check,
+                        'extra-file=s' => \@option_extra_file
     );
 
     if (@ARGV == 0) {
@@ -4770,6 +4785,7 @@ innobackupex [--compress] [--compress-threads=NUMBER-OF-THREADS] [--compress-chu
              [--incremental] [--incremental-basedir]
              [--incremental-dir] [--incremental-force-scan] [--incremental-lsn]
              [--compact]     
+             [--extra-file=FILE]
              BACKUP-ROOT-DIR
 
 innobackupex --apply-log [--use-memory=B]
@@ -5080,6 +5096,10 @@ This option specifies the MySQL username used when connecting to the server, if 
 =item --defaults-group=GROUP-NAME
 
 This option specifies the group name in my.cnf which should be used. This is needed for mysqld_multi deployments.
+
+=item --extra-file=FILE
+
+This option specifies an arbitrary file to include in the backup, useful for scripting and including metadata about the backup. The file, regardless of source location, will be copied into the root of the backup. The option accepts a string argument and can be passed multiple times.
 
 =item --version
 
