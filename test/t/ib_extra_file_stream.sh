@@ -18,7 +18,7 @@ innobackupex --stream=tar \
   --extra-file=$topdir/random/dir/an_extra_file2 \
   $topdir/backup > $topdir/backup/stream.tar
 
-if $TAR itf $topdir/backup/stream.tar | grep ^an_extra_file -c | grep 2; then
+if $TAR itf $topdir/backup/stream.tar | grep ^./an_extra_file -c | grep 2; then
     vlog "--extra-file was backed up"
 else
     vlog "--extra-file was not backed up"
