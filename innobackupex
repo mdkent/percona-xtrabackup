@@ -3296,19 +3296,10 @@ sub write_backup_info {
     }
 
     # print collected version info to a file
-    open(FILE, ">$backup_info") || 
-        Die "Failed to open file '$backup_info': $!";
-
-    print FILE "mysql_server_version = $mysql_server_version\n";
-    print FILE "xtrabackup_version = $xtrabackup_version\n";
-    print FILE "innobackup_version = $innobackup_version\n";
-    close(FILE);
-
-    if ($option_stream) {
-        stream_encrypt_file($option_tmpdir, 'xtrabackup_backup_info')
-                            and Die "Failed to stream 'xtrabackup_backup_info': $!";
-        unlink $backup_info || Die "Failed to delete '$backup_info': $!";
-    }
+    write_to_backup_file("$backup_info",
+      "mysql_server_version = $mysql_server_version\n" .
+      "xtrabackup_version = $xtrabackup_version\n" .
+      "innobackup_version = $innobackup_version\n");
 }
 
 #
