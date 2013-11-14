@@ -2,7 +2,7 @@
  Streaming and Compressing Backups
 ===================================
 
-Streaming mode, supported by |XtraBackup|, sends backup to ``STDOUT`` in special ``tar`` or |xbstream| format instead of copying files to the backup directory.
+Streaming mode, supported by |Percona XtraBackup|, sends backup to ``STDOUT`` in special ``tar`` or |xbstream| format instead of copying files to the backup directory.
 
 This allows you to use other programs to filter the output of the backup, providing greater flexibility for storage of the backup. For example, compression is achieved by piping the output to a compression utility. One of the benefits of streaming backups and using Unix pipes is that the backups can be automatically encrypted. 
 
@@ -12,9 +12,9 @@ To use the streaming feature, you must use the :option:`--stream`, providing the
 
 |innobackupex| starts |xtrabackup| in :option:`--log-stream` mode in a child process, and redirects its log to a temporary file. It then uses |xbstream| to stream all of the data files to ``STDOUT``, in a special ``xbstream`` format. See :doc:`../xbstream/xbstream` for details. After it finishes streaming all of the data files to ``STDOUT``, it stops xtrabackup and streams the saved log file too.
 
-When compression is enabled, |xtrabackup| compresses all output data, including the transaction log file and meta data files, using the specified compression algorithm. The only currently supported algorithm is 'quicklz'. The resulting files have the qpress archive format, i.e. every \*.qp file produced by xtrabackup is essentially a one-file qpress archive and can be extracted and uncompressed by the `qpress file archiver <http://www.quicklz.com/>`_. New algorithms (gzip, bzip2, etc.) may be added later with minor efforts.
+When compression is enabled, |xtrabackup| compresses all output data, including the transaction log file and meta data files, using the specified compression algorithm. The only currently supported algorithm is 'quicklz'. The resulting files have the qpress archive format, i.e. every \*.qp file produced by xtrabackup is essentially a one-file qpress archive and can be extracted and uncompressed by the `qpress file archiver <http://www.quicklz.com/>`_ which is available from `Percona Software repositories <http://www.percona.com/doc/percona-xtrabackup/2.1/installation.html#using-percona-software-repositories>`_. New algorithms (gzip, bzip2, etc.) may be added later with minor efforts.
 
-Using |xbstream| as a stream option, backups can be copied and compressed in parallel which can significantly speed up the backup process.  
+Using |xbstream| as a stream option, backups can be copied and compressed in parallel which can significantly speed up the backup process. In case backups were both compressed and encrypted, they'll need to decrypted first in order to be uncompressed. 
 
 Examples using xbstream
 =======================
@@ -46,7 +46,7 @@ To send the tar archive to another host: ::
 
  $ innobackupex --stream=tar ./ | ssh user@destination \ "cat - > /data/backups/backup.tar"
 
-.. warning::  To extract |XtraBackup|'s archive you **must** use |tar| with ``-i`` option::
+.. warning::  To extract |Percona XtraBackup|'s archive you **must** use |tar| with ``-i`` option::
 
   $ tar -xizf backup.tar.gz
 

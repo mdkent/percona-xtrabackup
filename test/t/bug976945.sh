@@ -3,10 +3,7 @@
 ############################################################################
 . inc/common.sh
 
-if [ -z "$XTRADB_VERSION" ]; then
-    echo "Requires XtraDB" > $SKIPPED_REASON
-    exit $SKIPPED_EXIT_CODE
-fi
+require_xtradb
 
 MYSQLD_EXTRA_MY_CNF_OPTS="
 innodb_log_block_size=4096

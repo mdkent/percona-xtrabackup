@@ -3,8 +3,8 @@
 # A script for making backups of InnoDB and MyISAM tables, indexes and .frm
 # files.
 #
-# Copyright 2003, 2009 Innobase Oy and Percona Ireland Ltd 2009-2012.
-# All Rights Reserved.
+# Copyright 2003, 2009 Innobase Oy. All Rights Reserved.
+# Copyright Percona LLC and/or its affiliates, 2009-2013.  All Rights Reserved.
 #
 
 use warnings FATAL => 'all';
@@ -29,7 +29,7 @@ my $innobackup_script = basename($0);
 # copyright notice
 my $copyright_notice =
 "InnoDB Backup Utility v${innobackup_version}; Copyright 2003, 2009 Innobase Oy
-and Percona Ireland Ltd 2009-2012.  All Rights Reserved.
+and Percona LLC and/or its affiliates 2009-2013.  All Rights Reserved.
 
 This software is published under
 the GNU GENERAL PUBLIC LICENSE Version 2, June 1991.
@@ -89,15 +89,16 @@ my $option_tables_file = '';
 my $option_throttle = '';
 my $option_sleep = '';
 my $option_compress = 999;
+my $option_decompress = '';
 my $option_compress_threads = 1;
 my $option_compress_chunk_size = '';
 my $option_encrypt = '';
+my $option_decrypt = '';
 my $option_encrypt_key = '';
 my $option_encrypt_key_file = '';
 my $encrypt_cmd = '';
 my $option_encrypt_threads = 1;
 my $option_encrypt_chunk_size = '';
-my $option_uncompress = '';
 my $option_export = '';
 my $option_use_memory = '';
 my $option_mysql_password = '';
@@ -140,6 +141,8 @@ my $option_rebuild_indexes = '';
 my $option_rebuild_threads = 0;
 
 my $option_debug_sleep_before_unlock = '';
+
+my $option_version_check = '';
 
 my %mysql;
 my $option_backup = '';
@@ -199,8 +202,31 @@ my $mysql_binlog_position = '';
 # run on a slave server
 my $mysql_slave_position = '';
 
+# process id if the script itself
+my $innobackupex_pid = $$;
+
 # process id of ibbackup program (runs as a child process of this script)
 my $ibbackup_pid = '';
+
+# process id of long queries killer
+my $query_killer_pid;
+
+# set kill long queries timeout in seconds
+my $option_kill_long_queries_timeout = 0;
+
+# waiting for an appropriate time to start FTWRL timeout
+my $option_lock_wait_timeout = 0;
+
+# how old should be query to be waited for
+my $option_lock_wait_threshold = 60;
+
+# which type of queries we are waiting for during the pre-FTWRL phase
+# possible values are "update" and "all"
+my $option_lock_wait_query_type = "all";
+
+# which type of queries wa are waiting when clearing the way for FTWRL
+# by killing; possible values are "select" and "all"
+my $option_kill_long_query_type = "all";
 
 # a counter for numbering mysql connection checks
 my $hello_id = 0;
@@ -244,6 +270,1247 @@ my $process_dir_exclude_regexp;
 my $copy_dir_overwrite;
 my $copy_dir_resolve_isl;
 
+# ###########################################################################
+# HTTPMicro package
+# This package is a copy without comments from the original.  The original
+# with comments and its test file can be found in the Bazaar repository at,
+#   lib/HTTPMicro.pm
+#   t/lib/HTTPMicro.t
+# See https://launchpad.net/percona-toolkit for more information.
+# ###########################################################################
+{
+
+package HTTPMicro;
+BEGIN {
+  $HTTPMicro::VERSION = '0.001';
+}
+use strict;
+use warnings;
+
+use Carp ();
+
+
+my @attributes;
+BEGIN {
+    @attributes = qw(agent timeout);
+    no strict 'refs';
+    for my $accessor ( @attributes ) {
+        *{$accessor} = sub {
+            @_ > 1 ? $_[0]->{$accessor} = $_[1] : $_[0]->{$accessor};
+        };
+    }
+}
+
+sub new {
+    my($class, %args) = @_;
+    (my $agent = $class) =~ s{::}{-}g;
+    my $self = {
+        agent        => $agent . "/" . ($class->VERSION || 0),
+        timeout      => 60,
+    };
+    for my $key ( @attributes ) {
+        $self->{$key} = $args{$key} if exists $args{$key}
+    }
+    return bless $self, $class;
+}
+
+my %DefaultPort = (
+    http => 80,
+    https => 443,
+);
+
+sub request {
+    my ($self, $method, $url, $args) = @_;
+    @_ == 3 || (@_ == 4 && ref $args eq 'HASH')
+      or Carp::croak(q/Usage: $http->request(METHOD, URL, [HASHREF])/);
+    $args ||= {}; # we keep some state in this during _request
+
+    my $response;
+    for ( 0 .. 1 ) {
+        $response = eval { $self->_request($method, $url, $args) };
+        last unless $@ && $method eq 'GET'
+            && $@ =~ m{^(?:Socket closed|Unexpected end)};
+    }
+
+    if (my $e = "$@") {
+        $response = {
+            success => q{},
+            status  => 599,
+            reason  => 'Internal Exception',
+            content => $e,
+            headers => {
+                'content-type'   => 'text/plain',
+                'content-length' => length $e,
+            }
+        };
+    }
+    return $response;
+}
+
+sub _request {
+    my ($self, $method, $url, $args) = @_;
+
+    my ($scheme, $host, $port, $path_query) = $self->_split_url($url);
+
+    my $request = {
+        method    => $method,
+        scheme    => $scheme,
+        host_port => ($port == $DefaultPort{$scheme} ? $host : "$host:$port"),
+        uri       => $path_query,
+        headers   => {},
+    };
+
+    my $handle  = HTTPMicro::Handle->new(timeout => $self->{timeout});
+
+    $handle->connect($scheme, $host, $port);
+
+    $self->_prepare_headers_and_cb($request, $args);
+    $handle->write_request_header(@{$request}{qw/method uri headers/});
+    $handle->write_content_body($request) if $request->{content};
+
+    my $response;
+    do { $response = $handle->read_response_header }
+        until (substr($response->{status},0,1) ne '1');
+
+    if (!($method eq 'HEAD' || $response->{status} =~ /^[23]04/)) {
+        $response->{content} = '';
+        $handle->read_content_body(sub { $_[1]->{content} .= $_[0] }, $response);
+    }
+
+    $handle->close;
+    $response->{success} = substr($response->{status},0,1) eq '2';
+    return $response;
+}
+
+sub _prepare_headers_and_cb {
+    my ($self, $request, $args) = @_;
+
+    for ($args->{headers}) {
+        next unless defined;
+        while (my ($k, $v) = each %$_) {
+            $request->{headers}{lc $k} = $v;
+        }
+    }
+    $request->{headers}{'host'}         = $request->{host_port};
+    $request->{headers}{'connection'}   = "close";
+    $request->{headers}{'user-agent'} ||= $self->{agent};
+
+    if (defined $args->{content}) {
+        $request->{headers}{'content-type'} ||= "application/octet-stream";
+        utf8::downgrade($args->{content}, 1)
+            or Carp::croak(q/Wide character in request message body/);
+        $request->{headers}{'content-length'} = length $args->{content};
+        $request->{content} = $args->{content};
+    }
+    return;
+}
+
+sub _split_url {
+    my $url = pop;
+
+    my ($scheme, $authority, $path_query) = $url =~ m<\A([^:/?#]+)://([^/?#]*)([^#]*)>
+      or Carp::croak(qq/Cannot parse URL: '$url'/);
+
+    $scheme     = lc $scheme;
+    $path_query = "/$path_query" unless $path_query =~ m<\A/>;
+
+    my $host = (length($authority)) ? lc $authority : 'localhost';
+       $host =~ s/\A[^@]*@//;   # userinfo
+    my $port = do {
+       $host =~ s/:([0-9]*)\z// && length $1
+         ? $1
+         : $DefaultPort{$scheme}
+    };
+
+    return ($scheme, $host, $port, $path_query);
+}
+
+package
+    HTTPMicro::Handle; # hide from PAUSE/indexers
+use strict;
+use warnings;
+
+use Carp       qw[croak];
+use Errno      qw[EINTR EPIPE];
+use IO::Socket qw[SOCK_STREAM];
+
+sub BUFSIZE () { 32768 }
+
+my $Printable = sub {
+    local $_ = shift;
+    s/\r/\\r/g;
+    s/\n/\\n/g;
+    s/\t/\\t/g;
+    s/([^\x20-\x7E])/sprintf('\\x%.2X', ord($1))/ge;
+    $_;
+};
+
+sub new {
+    my ($class, %args) = @_;
+    return bless {
+        rbuf             => '',
+        timeout          => 60,
+        max_line_size    => 16384,
+        %args
+    }, $class;
+}
+
+my $ssl_verify_args = {
+    check_cn => "when_only",
+    wildcards_in_alt => "anywhere",
+    wildcards_in_cn => "anywhere"
+};
+
+sub connect {
+    @_ == 4 || croak(q/Usage: $handle->connect(scheme, host, port)/);
+    my ($self, $scheme, $host, $port) = @_;
+
+    if ( $scheme eq 'https' ) {
+        eval "require IO::Socket::SSL"
+            unless exists $INC{'IO/Socket/SSL.pm'};
+        croak(qq/IO::Socket::SSL must be installed for https support\n/)
+            unless $INC{'IO/Socket/SSL.pm'};
+    }
+    elsif ( $scheme ne 'http' ) {
+      croak(qq/Unsupported URL scheme '$scheme'\n/);
+    }
+
+    $self->{fh} = 'IO::Socket::INET'->new(
+        PeerHost  => $host,
+        PeerPort  => $port,
+        Proto     => 'tcp',
+        Type      => SOCK_STREAM,
+        Timeout   => $self->{timeout}
+    ) or croak(qq/Could not connect to '$host:$port': $@/);
+
+    binmode($self->{fh})
+      or croak(qq/Could not binmode() socket: '$!'/);
+
+    if ( $scheme eq 'https') {
+        IO::Socket::SSL->start_SSL($self->{fh});
+        ref($self->{fh}) eq 'IO::Socket::SSL'
+            or die(qq/SSL connection failed for $host\n/);
+        if ( $self->{fh}->can("verify_hostname") ) {
+            $self->{fh}->verify_hostname( $host, $ssl_verify_args );
+        }
+        else {
+         my $fh = $self->{fh};
+         _verify_hostname_of_cert($host, _peer_certificate($fh), $ssl_verify_args)
+               or die(qq/SSL certificate not valid for $host\n/);
+         }
+    }
+      
+    $self->{host} = $host;
+    $self->{port} = $port;
+
+    return $self;
+}
+
+sub close {
+    @_ == 1 || croak(q/Usage: $handle->close()/);
+    my ($self) = @_;
+    CORE::close($self->{fh})
+      or croak(qq/Could not close socket: '$!'/);
+}
+
+sub write {
+    @_ == 2 || croak(q/Usage: $handle->write(buf)/);
+    my ($self, $buf) = @_;
+
+    my $len = length $buf;
+    my $off = 0;
+
+    local $SIG{PIPE} = 'IGNORE';
+
+    while () {
+        $self->can_write
+          or croak(q/Timed out while waiting for socket to become ready for writing/);
+        my $r = syswrite($self->{fh}, $buf, $len, $off);
+        if (defined $r) {
+            $len -= $r;
+            $off += $r;
+            last unless $len > 0;
+        }
+        elsif ($! == EPIPE) {
+            croak(qq/Socket closed by remote server: $!/);
+        }
+        elsif ($! != EINTR) {
+            croak(qq/Could not write to socket: '$!'/);
+        }
+    }
+    return $off;
+}
+
+sub read {
+    @_ == 2 || @_ == 3 || croak(q/Usage: $handle->read(len)/);
+    my ($self, $len) = @_;
+
+    my $buf  = '';
+    my $got = length $self->{rbuf};
+
+    if ($got) {
+        my $take = ($got < $len) ? $got : $len;
+        $buf  = substr($self->{rbuf}, 0, $take, '');
+        $len -= $take;
+    }
+
+    while ($len > 0) {
+        $self->can_read
+          or croak(q/Timed out while waiting for socket to become ready for reading/);
+        my $r = sysread($self->{fh}, $buf, $len, length $buf);
+        if (defined $r) {
+            last unless $r;
+            $len -= $r;
+        }
+        elsif ($! != EINTR) {
+            croak(qq/Could not read from socket: '$!'/);
+        }
+    }
+    if ($len) {
+        croak(q/Unexpected end of stream/);
+    }
+    return $buf;
+}
+
+sub readline {
+    @_ == 1 || croak(q/Usage: $handle->readline()/);
+    my ($self) = @_;
+
+    while () {
+        if ($self->{rbuf} =~ s/\A ([^\x0D\x0A]* \x0D?\x0A)//x) {
+            return $1;
+        }
+        $self->can_read
+          or croak(q/Timed out while waiting for socket to become ready for reading/);
+        my $r = sysread($self->{fh}, $self->{rbuf}, BUFSIZE, length $self->{rbuf});
+        if (defined $r) {
+            last unless $r;
+        }
+        elsif ($! != EINTR) {
+            croak(qq/Could not read from socket: '$!'/);
+        }
+    }
+    croak(q/Unexpected end of stream while looking for line/);
+}
+
+sub read_header_lines {
+    @_ == 1 || @_ == 2 || croak(q/Usage: $handle->read_header_lines([headers])/);
+    my ($self, $headers) = @_;
+    $headers ||= {};
+    my $lines   = 0;
+    my $val;
+
+    while () {
+         my $line = $self->readline;
+
+         if ($line =~ /\A ([^\x00-\x1F\x7F:]+) : [\x09\x20]* ([^\x0D\x0A]*)/x) {
+             my ($field_name) = lc $1;
+             $val = \($headers->{$field_name} = $2);
+         }
+         elsif ($line =~ /\A [\x09\x20]+ ([^\x0D\x0A]*)/x) {
+             $val
+               or croak(q/Unexpected header continuation line/);
+             next unless length $1;
+             $$val .= ' ' if length $$val;
+             $$val .= $1;
+         }
+         elsif ($line =~ /\A \x0D?\x0A \z/x) {
+            last;
+         }
+         else {
+            croak(q/Malformed header line: / . $Printable->($line));
+         }
+    }
+    return $headers;
+}
+
+sub write_header_lines {
+    (@_ == 2 && ref $_[1] eq 'HASH') || croak(q/Usage: $handle->write_header_lines(headers)/);
+    my($self, $headers) = @_;
+
+    my $buf = '';
+    while (my ($k, $v) = each %$headers) {
+        my $field_name = lc $k;
+         $field_name =~ /\A [\x21\x23-\x27\x2A\x2B\x2D\x2E\x30-\x39\x41-\x5A\x5E-\x7A\x7C\x7E]+ \z/x
+            or croak(q/Invalid HTTP header field name: / . $Printable->($field_name));
+         $field_name =~ s/\b(\w)/\u$1/g;
+         $buf .= "$field_name: $v\x0D\x0A";
+    }
+    $buf .= "\x0D\x0A";
+    return $self->write($buf);
+}
+
+sub read_content_body {
+    @_ == 3 || @_ == 4 || croak(q/Usage: $handle->read_content_body(callback, response, [read_length])/);
+    my ($self, $cb, $response, $len) = @_;
+    $len ||= $response->{headers}{'content-length'};
+
+    croak("No content-length in the returned response, and this "
+        . "UA doesn't implement chunking") unless defined $len;
+
+    while ($len > 0) {
+        my $read = ($len > BUFSIZE) ? BUFSIZE : $len;
+        $cb->($self->read($read), $response);
+        $len -= $read;
+    }
+
+    return;
+}
+
+sub write_content_body {
+    @_ == 2 || croak(q/Usage: $handle->write_content_body(request)/);
+    my ($self, $request) = @_;
+    my ($len, $content_length) = (0, $request->{headers}{'content-length'});
+
+    $len += $self->write($request->{content});
+
+    $len == $content_length
+      or croak(qq/Content-Length missmatch (got: $len expected: $content_length)/);
+
+    return $len;
+}
+
+sub read_response_header {
+    @_ == 1 || croak(q/Usage: $handle->read_response_header()/);
+    my ($self) = @_;
+
+    my $line = $self->readline;
+
+    $line =~ /\A (HTTP\/(0*\d+\.0*\d+)) [\x09\x20]+ ([0-9]{3}) [\x09\x20]+ ([^\x0D\x0A]*) \x0D?\x0A/x
+      or croak(q/Malformed Status-Line: / . $Printable->($line));
+
+    my ($protocol, $version, $status, $reason) = ($1, $2, $3, $4);
+
+    return {
+        status   => $status,
+        reason   => $reason,
+        headers  => $self->read_header_lines,
+        protocol => $protocol,
+    };
+}
+
+sub write_request_header {
+    @_ == 4 || croak(q/Usage: $handle->write_request_header(method, request_uri, headers)/);
+    my ($self, $method, $request_uri, $headers) = @_;
+
+    return $self->write("$method $request_uri HTTP/1.1\x0D\x0A")
+         + $self->write_header_lines($headers);
+}
+
+sub _do_timeout {
+    my ($self, $type, $timeout) = @_;
+    $timeout = $self->{timeout}
+        unless defined $timeout && $timeout >= 0;
+
+    my $fd = fileno $self->{fh};
+    defined $fd && $fd >= 0
+      or croak(q/select(2): 'Bad file descriptor'/);
+
+    my $initial = time;
+    my $pending = $timeout;
+    my $nfound;
+
+    vec(my $fdset = '', $fd, 1) = 1;
+
+    while () {
+        $nfound = ($type eq 'read')
+            ? select($fdset, undef, undef, $pending)
+            : select(undef, $fdset, undef, $pending) ;
+        if ($nfound == -1) {
+            $! == EINTR
+              or croak(qq/select(2): '$!'/);
+            redo if !$timeout || ($pending = $timeout - (time - $initial)) > 0;
+            $nfound = 0;
+        }
+        last;
+    }
+    $! = 0;
+    return $nfound;
+}
+
+sub can_read {
+    @_ == 1 || @_ == 2 || croak(q/Usage: $handle->can_read([timeout])/);
+    my $self = shift;
+    return $self->_do_timeout('read', @_)
+}
+
+sub can_write {
+    @_ == 1 || @_ == 2 || croak(q/Usage: $handle->can_write([timeout])/);
+    my $self = shift;
+    return $self->_do_timeout('write', @_)
+}
+
+my $prog = <<'EOP';
+BEGIN {
+   if ( defined &IO::Socket::SSL::CAN_IPV6 ) {
+      *CAN_IPV6 = \*IO::Socket::SSL::CAN_IPV6;
+   }
+   else {
+      constant->import( CAN_IPV6 => '' );
+   }
+   my %const = (
+      NID_CommonName => 13,
+      GEN_DNS => 2,
+      GEN_IPADD => 7,
+   );
+   while ( my ($name,$value) = each %const ) {
+      no strict 'refs';
+      *{$name} = UNIVERSAL::can( 'Net::SSLeay', $name ) || sub { $value };
+   }
+}
+{
+   my %dispatcher = (
+      issuer =>  sub { Net::SSLeay::X509_NAME_oneline( Net::SSLeay::X509_get_issuer_name( shift )) },
+      subject => sub { Net::SSLeay::X509_NAME_oneline( Net::SSLeay::X509_get_subject_name( shift )) },
+   );
+   if ( $Net::SSLeay::VERSION >= 1.30 ) {
+      $dispatcher{commonName} = sub {
+         my $cn = Net::SSLeay::X509_NAME_get_text_by_NID(
+            Net::SSLeay::X509_get_subject_name( shift ), NID_CommonName);
+         $cn =~s{\0$}{}; # work around Bug in Net::SSLeay <1.33
+         $cn;
+      }
+   } else {
+      $dispatcher{commonName} = sub {
+         croak "you need at least Net::SSLeay version 1.30 for getting commonName"
+      }
+   }
+
+   if ( $Net::SSLeay::VERSION >= 1.33 ) {
+      $dispatcher{subjectAltNames} = sub { Net::SSLeay::X509_get_subjectAltNames( shift ) };
+   } else {
+      $dispatcher{subjectAltNames} = sub {
+         return;
+      };
+   }
+
+   $dispatcher{authority} = $dispatcher{issuer};
+   $dispatcher{owner}     = $dispatcher{subject};
+   $dispatcher{cn}        = $dispatcher{commonName};
+
+   sub _peer_certificate {
+      my ($self, $field) = @_;
+      my $ssl = $self->_get_ssl_object or return;
+
+      my $cert = ${*$self}{_SSL_certificate}
+         ||= Net::SSLeay::get_peer_certificate($ssl)
+         or return $self->error("Could not retrieve peer certificate");
+
+      if ($field) {
+         my $sub = $dispatcher{$field} or croak
+            "invalid argument for peer_certificate, valid are: ".join( " ",keys %dispatcher ).
+            "\nMaybe you need to upgrade your Net::SSLeay";
+         return $sub->($cert);
+      } else {
+         return $cert
+      }
+   }
+
+
+   my %scheme = (
+      ldap => {
+         wildcards_in_cn    => 0,
+         wildcards_in_alt => 'leftmost',
+         check_cn         => 'always',
+      },
+      http => {
+         wildcards_in_cn    => 'anywhere',
+         wildcards_in_alt => 'anywhere',
+         check_cn         => 'when_only',
+      },
+      smtp => {
+         wildcards_in_cn    => 0,
+         wildcards_in_alt => 0,
+         check_cn         => 'always'
+      },
+      none => {}, # do not check
+   );
+
+   $scheme{www}  = $scheme{http}; # alias
+   $scheme{xmpp} = $scheme{http}; # rfc 3920
+   $scheme{pop3} = $scheme{ldap}; # rfc 2595
+   $scheme{imap} = $scheme{ldap}; # rfc 2595
+   $scheme{acap} = $scheme{ldap}; # rfc 2595
+   $scheme{nntp} = $scheme{ldap}; # rfc 4642
+   $scheme{ftp}  = $scheme{http}; # rfc 4217
+
+
+   sub _verify_hostname_of_cert {
+      my $identity = shift;
+      my $cert = shift;
+      my $scheme = shift || 'none';
+      if ( ! ref($scheme) ) {
+         $scheme = $scheme{$scheme} or croak "scheme $scheme not defined";
+      }
+
+      return 1 if ! %$scheme; # 'none'
+
+      my $commonName = $dispatcher{cn}->($cert);
+      my @altNames   = $dispatcher{subjectAltNames}->($cert);
+
+      if ( my $sub = $scheme->{callback} ) {
+         return $sub->($identity,$commonName,@altNames);
+      }
+
+
+      my $ipn;
+      if ( CAN_IPV6 and $identity =~m{:} ) {
+         $ipn = IO::Socket::SSL::inet_pton(IO::Socket::SSL::AF_INET6,$identity)
+            or croak "'$identity' is not IPv6, but neither IPv4 nor hostname";
+      } elsif ( $identity =~m{^\d+\.\d+\.\d+\.\d+$} ) {
+         $ipn = IO::Socket::SSL::inet_aton( $identity ) or croak "'$identity' is not IPv4, but neither IPv6 nor hostname";
+      } else {
+         if ( $identity =~m{[^a-zA-Z0-9_.\-]} ) {
+            $identity =~m{\0} and croak("name '$identity' has \\0 byte");
+            $identity = IO::Socket::SSL::idn_to_ascii($identity) or
+               croak "Warning: Given name '$identity' could not be converted to IDNA!";
+         }
+      }
+
+      my $check_name = sub {
+         my ($name,$identity,$wtyp) = @_;
+         $wtyp ||= '';
+         my $pattern;
+         if ( $wtyp eq 'anywhere' and $name =~m{^([a-zA-Z0-9_\-]*)\*(.+)} ) {
+            $pattern = qr{^\Q$1\E[a-zA-Z0-9_\-]*\Q$2\E$}i;
+         } elsif ( $wtyp eq 'leftmost' and $name =~m{^\*(\..+)$} ) {
+            $pattern = qr{^[a-zA-Z0-9_\-]*\Q$1\E$}i;
+         } else {
+            $pattern = qr{^\Q$name\E$}i;
+         }
+         return $identity =~ $pattern;
+      };
+
+      my $alt_dnsNames = 0;
+      while (@altNames) {
+         my ($type, $name) = splice (@altNames, 0, 2);
+         if ( $ipn and $type == GEN_IPADD ) {
+            return 1 if $ipn eq $name;
+
+         } elsif ( ! $ipn and $type == GEN_DNS ) {
+            $name =~s/\s+$//; $name =~s/^\s+//;
+            $alt_dnsNames++;
+            $check_name->($name,$identity,$scheme->{wildcards_in_alt})
+               and return 1;
+         }
+      }
+
+      if ( ! $ipn and (
+         $scheme->{check_cn} eq 'always' or
+         $scheme->{check_cn} eq 'when_only' and !$alt_dnsNames)) {
+         $check_name->($commonName,$identity,$scheme->{wildcards_in_cn})
+            and return 1;
+      }
+
+      return 0; # no match
+   }
+}
+EOP
+
+eval { require IO::Socket::SSL };
+if ( $INC{"IO/Socket/SSL.pm"} ) {
+   eval $prog;
+   die $@ if $@;
+}
+
+1;
+}
+# ###########################################################################
+# End HTTPMicro package
+# ###########################################################################
+
+# ###########################################################################
+# VersionCheck package
+# This package is a copy without comments from the original.  The original
+# with comments and its test file can be found in the Bazaar repository at,
+#   lib/VersionCheck.pm
+#   t/lib/VersionCheck.t
+# See https://launchpad.net/percona-toolkit for more information.
+# ###########################################################################
+{
+package VersionCheck;
+
+
+use strict;
+use warnings FATAL => 'all';
+use English qw(-no_match_vars);
+
+use constant PTDEBUG => $ENV{PTDEBUG} || 0;
+
+use Data::Dumper;
+local $Data::Dumper::Indent    = 1;
+local $Data::Dumper::Sortkeys  = 1;
+local $Data::Dumper::Quotekeys = 0;
+
+use Digest::MD5 qw(md5_hex);
+use Sys::Hostname qw(hostname);
+use File::Basename qw();
+use File::Spec;
+use FindBin qw();
+
+eval {
+   require Percona::Toolkit;
+   require HTTPMicro;
+};
+
+{
+   my $file    = 'percona-version-check';
+   my $home    = $ENV{HOME} || $ENV{HOMEPATH} || $ENV{USERPROFILE} || '.';
+   my @vc_dirs = (
+      '/etc/percona',
+      '/etc/percona-toolkit',
+      '/tmp',
+      "$home",
+   );
+
+   sub version_check_file {
+      foreach my $dir ( @vc_dirs ) {
+         if ( -d $dir && -w $dir ) {
+            PTDEBUG && _d('Version check file', $file, 'in', $dir);
+            return $dir . '/' . $file;
+         }
+      }
+      PTDEBUG && _d('Version check file', $file, 'in', $ENV{PWD});
+      return $file;  # in the CWD
+   } 
+}
+
+sub version_check_time_limit {
+   return 60 * 60 * 24;  # one day
+}
+
+
+sub version_check {
+   my (%args) = @_;
+
+   my $instances = $args{instances} || [];
+   my $instances_to_check;
+
+   PTDEBUG && _d('FindBin::Bin:', $FindBin::Bin);
+   if ( !$args{force} ) {
+      if ( $FindBin::Bin
+           && (-d "$FindBin::Bin/../.bzr" || -d "$FindBin::Bin/../../.bzr") ) {
+         PTDEBUG && _d("$FindBin::Bin/../.bzr disables --version-check");
+         return;
+      }
+   }
+
+   eval {
+      foreach my $instance ( @$instances ) {
+         my ($name, $id) = get_instance_id($instance);
+         $instance->{name} = $name;
+         $instance->{id}   = $id;
+      }
+
+      push @$instances, { name => 'system', id => 0 };
+
+      $instances_to_check = get_instances_to_check(
+         instances => $instances,
+         vc_file   => $args{vc_file},  # testing
+         now       => $args{now},      # testing
+      );
+      PTDEBUG && _d(scalar @$instances_to_check, 'instances to check');
+      return unless @$instances_to_check;
+
+      my $protocol = 'https';  # optimistic, but...
+      eval { require IO::Socket::SSL; };
+      if ( $EVAL_ERROR ) {
+         PTDEBUG && _d($EVAL_ERROR);
+         $protocol = 'http';
+      }
+      PTDEBUG && _d('Using', $protocol);
+
+      my $advice = pingback(
+         instances => $instances_to_check,
+         protocol  => $protocol,
+         url       => $args{url}                       # testing
+                   || $ENV{PERCONA_VERSION_CHECK_URL}  # testing
+                   || "$protocol://v.percona.com",
+      );
+      if ( $advice ) {
+         PTDEBUG && _d('Advice:', Dumper($advice));
+         if ( scalar @$advice > 1) {
+            print "\n# " . scalar @$advice . " software updates are "
+               . "available:\n";
+         }
+         else {
+            print "\n# A software update is available:\n";
+         }
+         print join("\n", map { "#   * $_" } @$advice), "\n\n";
+      }
+   };
+   if ( $EVAL_ERROR ) {
+      PTDEBUG && _d('Version check failed:', $EVAL_ERROR);
+   }
+
+   if ( @$instances_to_check ) {
+      eval {
+         update_check_times(
+            instances => $instances_to_check,
+            vc_file   => $args{vc_file},  # testing
+            now       => $args{now},      # testing
+         );
+      };
+      if ( $EVAL_ERROR ) {
+         PTDEBUG && _d('Error updating version check file:', $EVAL_ERROR);
+      }
+   }
+
+   if ( $ENV{PTDEBUG_VERSION_CHECK} ) {
+      warn "Exiting because the PTDEBUG_VERSION_CHECK "
+         . "environment variable is defined.\n";
+      exit 255;
+   }
+
+   return;
+}
+
+sub get_instances_to_check {
+   my (%args) = @_;
+
+   my $instances = $args{instances};
+   my $now       = $args{now}     || int(time);
+   my $vc_file   = $args{vc_file} || version_check_file();
+
+   if ( !-f $vc_file ) {
+      PTDEBUG && _d('Version check file', $vc_file, 'does not exist;',
+         'version checking all instances');
+      return $instances;
+   }
+
+   open my $fh, '<', $vc_file or die "Cannot open $vc_file: $OS_ERROR";
+   chomp(my $file_contents = do { local $/ = undef; <$fh> });
+   PTDEBUG && _d('Version check file', $vc_file, 'contents:', $file_contents);
+   close $fh;
+   my %last_check_time_for = $file_contents =~ /^([^,]+),(.+)$/mg;
+
+   my $check_time_limit = version_check_time_limit();
+   my @instances_to_check;
+   foreach my $instance ( @$instances ) {
+      my $last_check_time = $last_check_time_for{ $instance->{id} };
+      PTDEBUG && _d('Intsance', $instance->{id}, 'last checked',
+         $last_check_time, 'now', $now, 'diff', $now - ($last_check_time || 0),
+         'hours until next check',
+         sprintf '%.2f',
+            ($check_time_limit - ($now - ($last_check_time || 0))) / 3600);
+      if ( !defined $last_check_time
+           || ($now - $last_check_time) >= $check_time_limit ) {
+         PTDEBUG && _d('Time to check', Dumper($instance));
+         push @instances_to_check, $instance;
+      }
+   }
+
+   return \@instances_to_check;
+}
+
+sub update_check_times {
+   my (%args) = @_;
+
+   my $instances = $args{instances};
+   my $now       = $args{now}     || int(time);
+   my $vc_file   = $args{vc_file} || version_check_file();
+   PTDEBUG && _d('Updating last check time:', $now);
+
+   my %all_instances = map {
+      $_->{id} => { name => $_->{name}, ts => $now }
+   } @$instances;
+
+   if ( -f $vc_file ) {
+      open my $fh, '<', $vc_file or die "Cannot read $vc_file: $OS_ERROR";
+      my $contents = do { local $/ = undef; <$fh> };
+      close $fh;
+
+      foreach my $line ( split("\n", ($contents || '')) ) {
+         my ($id, $ts) = split(',', $line);
+         if ( !exists $all_instances{$id} ) {
+            $all_instances{$id} = { ts => $ts };  # original ts, not updated
+         }
+      }
+   }
+
+   open my $fh, '>', $vc_file or die "Cannot write to $vc_file: $OS_ERROR";
+   foreach my $id ( sort keys %all_instances ) {
+      PTDEBUG && _d('Updated:', $id, Dumper($all_instances{$id}));
+      print { $fh } $id . ',' . $all_instances{$id}->{ts} . "\n";
+   }
+   close $fh;
+
+   return;
+}
+
+sub get_instance_id {
+   my ($instance) = @_;
+
+   my $dbh = $instance->{dbh};
+   my $dsn = $instance->{dsn};
+
+   my $sql = q{SELECT CONCAT(@@hostname, @@port)};
+   PTDEBUG && _d($sql);
+   my ($name) = eval { $dbh->selectrow_array($sql) };
+   if ( $EVAL_ERROR ) {
+      PTDEBUG && _d($EVAL_ERROR);
+      $sql = q{SELECT @@hostname};
+      PTDEBUG && _d($sql);
+      ($name) = eval { $dbh->selectrow_array($sql) };
+      if ( $EVAL_ERROR ) {
+         PTDEBUG && _d($EVAL_ERROR);
+         $name = ($dsn->{h} || 'localhost') . ($dsn->{P} || 3306);
+      }
+      else {
+         $sql = q{SHOW VARIABLES LIKE 'port'};
+         PTDEBUG && _d($sql);
+         my (undef, $port) = eval { $dbh->selectrow_array($sql) };
+         PTDEBUG && _d('port:', $port);
+         $name .= $port || '';
+      }
+   }
+   my $id = md5_hex($name);
+
+   PTDEBUG && _d('MySQL instance:', $id, $name, Dumper($dsn));
+
+   return $name, $id;
+}
+
+
+sub pingback {
+   my (%args) = @_;
+   my @required_args = qw(url instances);
+   foreach my $arg ( @required_args ) {
+      die "I need a $arg arugment" unless $args{$arg};
+   }
+   my $url       = $args{url};
+   my $instances = $args{instances};
+
+   my $ua = $args{ua} || HTTPMicro->new( timeout => 3 );
+
+   my $response = $ua->request('GET', $url);
+   PTDEBUG && _d('Server response:', Dumper($response));
+   die "No response from GET $url"
+      if !$response;
+   die("GET on $url returned HTTP status $response->{status}; expected 200\n",
+       ($response->{content} || '')) if $response->{status} != 200;
+   die("GET on $url did not return any programs to check")
+      if !$response->{content};
+
+   my $items = parse_server_response(
+      response => $response->{content}
+   );
+   die "Failed to parse server requested programs: $response->{content}"
+      if !scalar keys %$items;
+      
+   my $versions = get_versions(
+      items     => $items,
+      instances => $instances,
+   );
+   die "Failed to get any program versions; should have at least gotten Perl"
+      if !scalar keys %$versions;
+
+   my $client_content = encode_client_response(
+      items      => $items,
+      versions   => $versions,
+      general_id => md5_hex( hostname() ),
+   );
+
+   my $client_response = {
+      headers => { "X-Percona-Toolkit-Tool" => File::Basename::basename($0) },
+      content => $client_content,
+   };
+   PTDEBUG && _d('Client response:', Dumper($client_response));
+
+   $response = $ua->request('POST', $url, $client_response);
+   PTDEBUG && _d('Server suggestions:', Dumper($response));
+   die "No response from POST $url $client_response"
+      if !$response;
+   die "POST $url returned HTTP status $response->{status}; expected 200"
+      if $response->{status} != 200;
+
+   return unless $response->{content};
+
+   $items = parse_server_response(
+      response   => $response->{content},
+      split_vars => 0,
+   );
+   die "Failed to parse server suggestions: $response->{content}"
+      if !scalar keys %$items;
+   my @suggestions = map { $_->{vars} }
+                     sort { $a->{item} cmp $b->{item} }
+                     values %$items;
+
+   return \@suggestions;
+}
+
+sub encode_client_response {
+   my (%args) = @_;
+   my @required_args = qw(items versions general_id);
+   foreach my $arg ( @required_args ) {
+      die "I need a $arg arugment" unless $args{$arg};
+   }
+   my ($items, $versions, $general_id) = @args{@required_args};
+
+   my @lines;
+   foreach my $item ( sort keys %$items ) {
+      next unless exists $versions->{$item};
+      if ( ref($versions->{$item}) eq 'HASH' ) {
+         my $mysql_versions = $versions->{$item};
+         for my $id ( sort keys %$mysql_versions ) {
+            push @lines, join(';', $id, $item, $mysql_versions->{$id});
+         }
+      }
+      else {
+         push @lines, join(';', $general_id, $item, $versions->{$item});
+      }
+   }
+
+   my $client_response = join("\n", @lines) . "\n";
+   return $client_response;
+}
+
+sub parse_server_response {
+   my (%args) = @_;
+   my @required_args = qw(response);
+   foreach my $arg ( @required_args ) {
+      die "I need a $arg arugment" unless $args{$arg};
+   }
+   my ($response) = @args{@required_args};
+
+   my %items = map {
+      my ($item, $type, $vars) = split(";", $_);
+      if ( !defined $args{split_vars} || $args{split_vars} ) {
+         $vars = [ split(",", ($vars || '')) ];
+      }
+      $item => {
+         item => $item,
+         type => $type,
+         vars => $vars,
+      };
+   } split("\n", $response);
+
+   PTDEBUG && _d('Items:', Dumper(\%items));
+
+   return \%items;
+}
+
+my %sub_for_type = (
+   os_version          => \&get_os_version,
+   perl_version        => \&get_perl_version,
+   perl_module_version => \&get_perl_module_version,
+   mysql_variable      => \&get_mysql_variable,
+   bin_version         => \&get_bin_version,
+);
+
+sub valid_item {
+   my ($item) = @_;
+   return unless $item;
+   if ( !exists $sub_for_type{ $item->{type} } ) {
+      PTDEBUG && _d('Invalid type:', $item->{type});
+      return 0;
+   }
+   return 1;
+}
+
+sub get_versions {
+   my (%args) = @_;
+   my @required_args = qw(items);
+   foreach my $arg ( @required_args ) {
+      die "I need a $arg arugment" unless $args{$arg};
+   }
+   my ($items) = @args{@required_args};
+
+   my %versions;
+   foreach my $item ( values %$items ) {
+      next unless valid_item($item);
+      eval {
+         my $version = $sub_for_type{ $item->{type} }->(
+            item      => $item,
+            instances => $args{instances},
+         );
+         if ( $version ) {
+            chomp $version unless ref($version);
+            $versions{$item->{item}} = $version;
+         }
+      };
+      if ( $EVAL_ERROR ) {
+         PTDEBUG && _d('Error getting version for', Dumper($item), $EVAL_ERROR);
+      }
+   }
+
+   return \%versions;
+}
+
+
+sub get_os_version {
+   if ( $OSNAME eq 'MSWin32' ) {
+      require Win32;
+      return Win32::GetOSDisplayName();
+   }
+
+  chomp(my $platform = `uname -s`);
+  PTDEBUG && _d('platform:', $platform);
+  return $OSNAME unless $platform;
+
+   chomp(my $lsb_release
+            = `which lsb_release 2>/dev/null | awk '{print \$1}'` || '');
+   PTDEBUG && _d('lsb_release:', $lsb_release);
+
+   my $release = "";
+
+   if ( $platform eq 'Linux' ) {
+      if ( -f "/etc/fedora-release" ) {
+         $release = `cat /etc/fedora-release`;
+      }
+      elsif ( -f "/etc/redhat-release" ) {
+         $release = `cat /etc/redhat-release`;
+      }
+      elsif ( -f "/etc/system-release" ) {
+         $release = `cat /etc/system-release`;
+      }
+      elsif ( $lsb_release ) {
+         $release = `$lsb_release -ds`;
+      }
+      elsif ( -f "/etc/lsb-release" ) {
+         $release = `grep DISTRIB_DESCRIPTION /etc/lsb-release`;
+         $release =~ s/^\w+="([^"]+)".+/$1/;
+      }
+      elsif ( -f "/etc/debian_version" ) {
+         chomp(my $rel = `cat /etc/debian_version`);
+         $release = "Debian $rel";
+         if ( -f "/etc/apt/sources.list" ) {
+             chomp(my $code_name = `awk '/^deb/ {print \$3}' /etc/apt/sources.list | awk -F/ '{print \$1}'| awk 'BEGIN {FS="|"} {print \$1}' | sort | uniq -c | sort -rn | head -n1 | awk '{print \$2}'`);
+             $release .= " ($code_name)" if $code_name;
+         }
+      }
+      elsif ( -f "/etc/os-release" ) { # openSUSE
+         chomp($release = `grep PRETTY_NAME /etc/os-release`);
+         $release =~ s/^PRETTY_NAME="(.+)"$/$1/;
+      }
+      elsif ( `ls /etc/*release 2>/dev/null` ) {
+         if ( `grep DISTRIB_DESCRIPTION /etc/*release 2>/dev/null` ) {
+            $release = `grep DISTRIB_DESCRIPTION /etc/*release | head -n1`;
+         }
+         else {
+            $release = `cat /etc/*release | head -n1`;
+         }
+      }
+   }
+   elsif ( $platform =~ m/(?:BSD|^Darwin)$/ ) {
+      my $rel = `uname -r`;
+      $release = "$platform $rel";
+   }
+   elsif ( $platform eq "SunOS" ) {
+      my $rel = `head -n1 /etc/release` || `uname -r`;
+      $release = "$platform $rel";
+   }
+
+   if ( !$release ) {
+      PTDEBUG && _d('Failed to get the release, using platform');
+      $release = $platform;
+   }
+   chomp($release);
+
+   $release =~ s/^"|"$//g;
+
+   PTDEBUG && _d('OS version =', $release);
+   return $release;
+}
+
+sub get_perl_version {
+   my (%args) = @_;
+   my $item = $args{item};
+   return unless $item;
+
+   my $version = sprintf '%vd', $PERL_VERSION;
+   PTDEBUG && _d('Perl version', $version);
+   return $version;
+}
+
+sub get_perl_module_version {
+   my (%args) = @_;
+   my $item = $args{item};
+   return unless $item;
+
+   my $var     = '$' . $item->{item} . '::VERSION';
+   my $version = eval "use $item->{item}; $var;";
+   PTDEBUG && _d('Perl version for', $var, '=', $version);
+   return $version;
+}
+
+sub get_mysql_variable {
+   return get_from_mysql(
+      show => 'VARIABLES',
+      @_,
+   );
+}
+
+sub get_from_mysql {
+   my (%args) = @_;
+   my $show      = $args{show};
+   my $item      = $args{item};
+   my $instances = $args{instances};
+   return unless $show && $item;
+
+   if ( !$instances || !@$instances ) {
+      PTDEBUG && _d('Cannot check', $item,
+         'because there are no MySQL instances');
+      return;
+   }
+
+   my @versions;
+   my %version_for;
+   foreach my $instance ( @$instances ) {
+      next unless $instance->{id};  # special system instance has id=0
+      my $dbh = $instance->{dbh};
+      local $dbh->{FetchHashKeyName} = 'NAME_lc';
+      my $sql = qq/SHOW $show/;
+      PTDEBUG && _d($sql);
+      my $rows = $dbh->selectall_hashref($sql, 'variable_name');
+
+      my @versions;
+      foreach my $var ( @{$item->{vars}} ) {
+         $var = lc($var);
+         my $version = $rows->{$var}->{value};
+         PTDEBUG && _d('MySQL version for', $item->{item}, '=', $version,
+            'on', $instance->{name});
+         push @versions, $version;
+      }
+      $version_for{ $instance->{id} } = join(' ', @versions);
+   }
+
+   return \%version_for;
+}
+
+sub get_bin_version {
+   my (%args) = @_;
+   my $item = $args{item};
+   my $cmd  = $item->{item};
+   return unless $cmd;
+
+   my $sanitized_command = File::Basename::basename($cmd);
+   PTDEBUG && _d('cmd:', $cmd, 'sanitized:', $sanitized_command);
+   return if $sanitized_command !~ /\A[a-zA-Z0-9_-]+\z/;
+
+   my $output = `$sanitized_command --version 2>&1`;
+   PTDEBUG && _d('output:', $output);
+
+   my ($version) = $output =~ /v?([0-9]+\.[0-9]+(?:\.[\w-]+)?)/;
+
+   PTDEBUG && _d('Version for', $sanitized_command, '=', $version);
+   return $version;
+}
+
+sub _d {
+   my ($package, undef, $line) = caller 0;
+   @_ = map { (my $temp = $_) =~ s/\n/\n# /g; $temp; }
+        map { defined $_ ? $_ : 'undef' }
+        @_;
+   print STDERR "# $package:$line $PID ", join(' ', @_), "\n";
+}
+
+1;
+}
+# ###########################################################################
+# End VersionCheck package
+# ###########################################################################
+
 ######################################################################
 # program execution begins here
 ######################################################################
@@ -277,7 +1544,7 @@ if ($option_copy_back || $option_move_back) {
                         if ($mysql{dbh}) {
                             print STDERR "Connected successfully\n";
                             $option_ibbackup_binary = set_xtrabackup_version();
-                            mysql_close();
+                            mysql_close(\%mysql);
                         } else {
      		            die "Failed to connect to MySQL server to detect version.\nYou must set xtrabackup version to use with --ibbackup option.\nPossible values are xtrabackup_55 (for MySQL 5.5), xtrabackup_56 (for MySQL or Percona Server 5.6, or xtrabackup (for MySQL 5.1 with InnoDB plugin or Percona Server)\n";
                         }
@@ -290,12 +1557,48 @@ if ($option_copy_back || $option_move_back) {
     if ($option_ibbackup_binary eq 'autodetect') {
         $option_ibbackup_binary = set_xtrabackup_version();
     }
+
+    if ($option_version_check) {
+        $now = current_time();
+        print STDERR
+            "$now  $prefix Executing a version check against the server...\n";
+        VersionCheck::version_check(
+                                    force => 1,
+                                    instances => [ {
+                                                    dbh => $mysql{dbh},
+                                                    dsn => $mysql{dsn}
+                                                   }
+                                                 ]
+                                    );
+        $now = current_time();
+        print STDERR "$now  $prefix Done.\n";
+    }
 }
 init();
 
 my $ibbackup_exit_code = 0;
 
-if ($option_copy_back) {
+if ($option_decompress || $option_decrypt) {
+    # decrypt/decompress files
+    if ($option_decompress && $option_decrypt) {
+      # Call mode 0 first as it is fastest but may cause stream buffer overruns
+      # requiring user invoke innobackupex twice, once for decrypt and again
+      # for decompress. Mode 0 will take .qb.xbcrypt and run it through
+      # xbcrypt | qpress > result. This should get all InnoDB files but any
+      # metadata or MyISAM, etc. will not be .qp.xbcrypt, only .xbcrypt
+      decrypt_decompress(0);
+      # Now call mode 1 to decrypt any uncompressed files, those with only a
+      # .xbcrypt extension
+      decrypt_decompress(1);
+      # Now, just in case there were any compressed files only, run throuh and
+      # decompress any .qp files
+      decrypt_decompress(2);
+    } elsif ($option_decompress) {
+      decrypt_decompress(2);
+    } else {
+      decrypt_decompress(1);
+    }
+} elsif ($option_copy_back) {
     # copy files from backup directory back to their original locations
     copy_back(0);
 } elsif ($option_move_back) {
@@ -310,21 +1613,7 @@ if ($option_copy_back) {
 
     mysql_close(\%mysql);
 
-    if ($option_stream) {
-      open XTRABACKUP_BINARY, "> $option_tmpdir/$xtrabackup_binary_file"
-    	|| die "Cannot open file $option_tmpdir/$xtrabackup_binary_file: $!\n";
-    } else {
-      open XTRABACKUP_BINARY, "> $backup_dir/$xtrabackup_binary_file"
-    	|| die "Cannot open file $backup_dir/$xtrabackup_binary_file: $!\n";
-    }
-    print XTRABACKUP_BINARY $option_ibbackup_binary;
-    close XTRABACKUP_BINARY;
-
-    if ($option_stream) {
-      stream_encrypt_file($option_tmpdir, $xtrabackup_binary_file)
-                          && die "Failed to stream $xtrabackup_binary_file: $!";
-      unlink "$option_tmpdir/$xtrabackup_binary_file";
-    }
+    write_to_backup_file("$work_dir/$xtrabackup_binary_file", "$option_ibbackup_binary");
 }
 
 $now = current_time();
@@ -373,23 +1662,248 @@ sub current_time {
     return strftime("%y%m%d %H:%M:%S", localtime());
 }
 
-
 #
-# Die subroutine kills all child processes and exits this process.
-# This subroutine takes the same argument as the built-in die function.
-#    Parameters:
-#       message   string which is printed to stdout
+# Global initialization:
 #
-sub Die {
-    my $message = shift;
+# - embed the HTTPMicro and VersionCheck modules by setting %INC to this
+#   file, so Perl does not try to load those modules from @INC
+#
+# - Override the 'die' builtin to customize the format of error messages
+#
+# - Setup signal handlers to terminate gracefully on fatal signals
+#
+BEGIN {
+    $INC{$_} = __FILE__ for map { (my $pkg = "$_.pm") =~ s!::!/!g; $pkg } (qw(
+      HTTPMicro
+      VersionCheck
+      ));
 
-    # kill all child processes of this process
-    kill_child_processes();
+    *CORE::GLOBAL::die = sub {
 
-    die "$prefix Error: $message";
+        print STDERR "$prefix Error: @_";
+
+        # Mimic the default 'die' behavior: append information about the caller
+        # and the new line, if the argument does not already end with a newline
+        if ($_[-1] !~ m(\n$)) {
+            my ($pkg, $file, $line) = caller 0;
+
+            print STDERR " at $file line $line.\n";
+        }
+
+        exit(1);
+    };
+
+    foreach ('HUP', 'INT', 'QUIT', 'ABRT', 'PIPE', 'TERM', 'XFSZ') {
+        $SIG{$_} = \&catch_fatal_signal;
+    }
 }
-    
 
+#
+# Make sure all child processes are killed on exit. This doesn't cover cases
+# when innobackupex is terminated with a signal.
+#
+END {
+    # We only want to execute this in the parent script process, and ignore
+    # for all child processes it may spawn
+    if ($$ == $innobackupex_pid) {
+        kill_child_processes();
+    }
+}
+
+#
+# kill child processes spawned by the script
+#
+sub kill_child_processes {
+    if ($ibbackup_pid) {
+        kill($kill_signal, $ibbackup_pid);
+        wait_for_ibbackup_finish();
+    }
+    stop_query_killer();
+}
+
+sub catch_fatal_signal {
+    # Don't print anything if a child process is terminated with a signal
+    if ($$ == $innobackupex_pid) {
+        die "Terminated with SIG$_[0]"
+    } else {
+        exit(1);
+    }
+}
+
+#
+# Finds all files that match the given pattern recursively beneath
+# the given directory. Returns a list of files with their paths relative 
+# to the starting search directory.
+#
+sub find_all_matching_files {
+  my $dir = shift;
+  my $pattern = shift;
+  my $child;
+  my @dirlist;
+  my @retlist;
+ 
+  opendir(FINDDIR, $dir)
+        || die "Can't open directory '$dir': $!";
+
+  while (defined($child = readdir(FINDDIR))) {
+    next if $child eq "." || $child eq "..";
+    if ($child =~ m/$pattern/) { push(@retlist, "$dir/$child"); }
+    elsif ( -d "$dir/$child") { push(@dirlist, "$dir/$child"); }
+  }
+  closedir(FINDDIR);
+
+  foreach $child (@dirlist) {
+    push(@retlist, find_all_matching_files("$child", "$pattern"));
+  }
+  return (@retlist);
+}
+
+#
+# decrypts and/or decompresses an individual file amd removes the source
+# on success.
+# mode is same mode as defined for sub decrypt_decompress()
+sub decrypt_decompress_file {
+  my $mode = shift;
+  my $file = shift;
+  my $file_ext = shift;
+  my $decrypt_opts = shift;
+
+  my $file_cmd;
+  my $dest_file=substr($file, 0, length($file) - length($file_ext));
+
+  if ($mode == 0) {
+    $file_cmd = "xbcrypt --decrypt $decrypt_opts --input=" . $file . " | qpress -dio > " . $dest_file;
+  } elsif ($mode == 1) {
+    $file_cmd = "xbcrypt --decrypt $decrypt_opts --input=" . $file . " --output=" . $dest_file;
+  } elsif ($mode == 2) {
+    $file_cmd = "qpress -do " . $file . " > " . $dest_file;
+  } else {
+    die "Unknown decrypt_decompress mode : $mode";
+  }
+  print STDERR "$prefix $file_cmd\n";
+  system("$file_cmd") && die "$file_cmd failed with $!";
+  system("rm -f $file");
+}
+
+#
+# Decrypts and decompresses a backup made with --compress and/or --encrypt
+#
+# mode 0 = decrypt and decompress .qp.xbcrypt files
+# mode 1 = decrypt .xbcrypt files
+# mode 2 = decompress .qp files
+#
+sub decrypt_decompress {
+  my $mode = shift;
+  my $file_ext;
+  my $decrypt_opts = '';
+  my @files;
+
+  # first, build out the decryption opts. They will not be used and option
+  # values may not be specified if doing decompress only.
+  if ($mode != 2) {
+    if ($option_decrypt) {
+      $decrypt_opts = "--encrypt-algo=$option_decrypt"
+    }
+    if ($option_encrypt_key) {
+      $decrypt_opts = $decrypt_opts . " --encrypt-key=$option_encrypt_key";
+    } elsif ($option_encrypt_key_file) {
+      $decrypt_opts = $decrypt_opts . " --encrypt-key-file=$option_encrypt_key_file";
+    }
+  }
+
+  # based on the mode, determine which files we are interested in
+  if ($mode == 0) {
+    $file_ext = ".qp.xbcrypt";
+  } elsif ($mode == 1) {
+    $file_ext = ".xbcrypt";
+  } elsif ($mode == 2) {
+    $file_ext = ".qp";
+  } else {
+    die "Unknown decrypt_decompress mode : $mode";
+  }
+
+  # recursively find all files of interest in the backup set
+  @files = find_all_matching_files("$backup_dir", "\\$file_ext\$");
+
+  # runing serially
+  if (!$option_parallel) {
+    my $file;
+    foreach $file (@files) {
+      decrypt_decompress_file($mode, $file, $file_ext, $decrypt_opts);
+    }
+  # running parallel, FUN!
+  } else {
+    my @pids;
+    my @workingfiles;
+    my $file;
+    my $freepidindex;
+    
+    # this will maintain the list of forks so we can wait for completion
+    # and check return status as well as stay within the limits of the 
+    # --parallel value
+    $pids[$option_parallel - 1] = undef;
+
+    # this is the file for which each fork is currently working on. just
+    # used for logging/reporting purposed in case of a failure.
+    $workingfiles[$option_parallel - 1] = undef;
+
+    foreach $file (@files) {
+      # this while loop below tries to find an unused child/fork slot, ie, one
+      # that is not currently working/running. it will loop indefinitely,
+      # iterating the number of slots and watching for a child to finish
+      # and use that now vacant slot.
+      $freepidindex=$option_parallel;
+      while ($freepidindex >= $option_parallel) {
+        for ($freepidindex = 0; $freepidindex < $option_parallel; $freepidindex++) {
+          last if not defined $pids[$freepidindex];
+
+          my $status = waitpid($pids[$freepidindex], WNOHANG);
+          if ($status == $pids[$freepidindex]) {
+            my $childretcode = $? >> 8;
+            if ($childretcode != 0) {
+              die "Child failed on $workingfiles[$freepidindex] : $childretcode";
+            }
+            last;
+          } elsif ($status == -1) {
+            die "waitpid failed on $workingfiles[$freepidindex] : $status";
+          }
+        }
+        # couldn't find a free slot yet so sleep for 1/10 th of a second or so.
+        # sleeping for a much longer (even a second) can make the whole process
+        # take longer when there are a lot of smaller files to process as they
+        # can be done very quickly. 1/10th doesn't seem to add any real overhead
+        # to this controlling process when compared to letting it spin freely.
+        if ($freepidindex >= $option_parallel) {
+          usleep(100000);
+        }
+      }
+      # so now we have a slot identified by freepidindex, set up the workingfiles,
+      # fork and do the work.
+      $workingfiles[$freepidindex] = $file;
+      $pids[$freepidindex] = fork();
+      if ($pids[$freepidindex] == 0) {
+        decrypt_decompress_file($mode, $file, $file_ext, $decrypt_opts);
+        exit 0;
+      }
+    }
+    # we've started processing of all files that we know about, now just need
+    # to wait for the last bunch to finish up and check for any errors before
+    # returning.
+    for ($freepidindex = 0; $freepidindex < $option_parallel; $freepidindex++) {
+      next if not defined $pids[$freepidindex];
+      my $status = waitpid($pids[$freepidindex], 0);
+      my $childretcode = $? >> 8;
+      if ($status == $pids[$freepidindex]) {
+        if ($childretcode != 0) {
+          die "Child failed on $workingfiles[$freepidindex] : $childretcode";
+        }
+      } else {
+        die "waitpid failed on $workingfiles[$freepidindex] : $status";
+      }
+    }
+  }
+}
+ 
 #
 # backup subroutine makes a backup of InnoDB and MyISAM tables, indexes and 
 # .frm files. It connects to the database server and runs ibbackup as a child
@@ -420,28 +1934,40 @@ sub backup {
     $suspend_file = $work_dir . $xb_fn_suspended_at_end;
     wait_for_ibbackup_suspend($suspend_file);
 
-    if ($option_safe_slave_backup) {
-        wait_for_safe_slave(\%mysql);
-    }
-
-    # flush tables with read lock
     if (!$option_no_lock) {
-        # make a prep copy before locking tables, if using rsync
-        backup_files(1);
+      if ($option_safe_slave_backup) {
+        wait_for_safe_slave(\%mysql);
+      }
 
-        # flush tables with read lock
-        mysql_lockall(\%mysql);
-    }
+      # flush tables with read lock
+      # make a prep copy before locking tables, if using rsync
+      backup_files(1);
 
-    if ($option_slave_info) {
+      # flush tables with read lock
+      mysql_lockall(\%mysql);
+
+      if ($option_slave_info) {
         write_slave_info(\%mysql);
+      }
     }
-
 
     # backup non-InnoDB files and tables
     # (or finalize the backup by syncing changes if using rsync)
     backup_files(0);
 
+    # There is no need to stop slave thread before coping non-Innodb data when
+    # --no-lock option is used because --no-lock option requires that no DDL or
+    # DML to non-transaction tables can occur.
+    if ($option_no_lock)
+    {
+      if ($option_safe_slave_backup)
+      {
+        wait_for_safe_slave(\%mysql);
+      }
+      if ($option_slave_info) {
+        write_slave_info(\%mysql);
+      }
+    }
     # resume XtraBackup and wait till it has finished
     resume_ibbackup($suspend_file);
     $suspend_file = $work_dir . $xb_fn_log_copied;
@@ -460,18 +1986,9 @@ sub backup {
     # copy ib_lru_dump
     # Copy buffer poll dump and/or LRU dump
     foreach my $dump_name ($buffer_pool_filename, 'ib_lru_dump') {
-        if (-e "$orig_datadir/$dump_name") {
-            if ($option_stream) {
-                print STDERR "$prefix Backing up as tar stream '$dump_name'\n";
-                stream_encrypt_file($orig_datadir, "$dump_name")
-                                    and Die "Failed to stream '$dump_name': $!";
-            } elsif (!$option_rsync) {
-                my $src_name = escape_path("$orig_datadir/$dump_name");
-                my $dst_name = escape_path("$backup_dir/$dump_name");
-                system("$CP_CMD \"$src_name\" \"$dst_name\"")
-                    and Die "Failed to copy file '$dump_name': $!";
-            }
-        }
+      if (!$option_rsync && -e "$orig_datadir/$dump_name") {
+        backup_file("$orig_datadir", "$dump_name", "$backup_dir/$dump_name")
+      }
     }
 
     print STDERR "\n$prefix Backup created in directory '$backup_dir'\n";
@@ -592,7 +2109,7 @@ sub copy_file {
     my $dst_path = shift;
 
     print STDERR "$prefix Copying '$src_path' to '$dst_path'\n";
-    copy($src_path, $dst_path) or Die "copy failed: $!";
+    copy($src_path, $dst_path) or die "copy failed: $!";
 }
 
 #
@@ -603,7 +2120,7 @@ sub move_file {
     my $dst_path = shift;
 
     print STDERR "$prefix Moving '$src_path' to '$dst_path'\n";
-    move($src_path, $dst_path) or Die "move failed: $!";
+    move($src_path, $dst_path) or die "move failed: $!";
 }
 
 
@@ -648,14 +2165,14 @@ sub process_file {
 	# Create the directory in the destination if necessary
 	if (! -e "$dst_path") {
 	    print STDERR "$prefix Creating directory '$dst_path'\n";
-	    mkdir "$dst_path" or Die "mkdir failed: $!";
+	    mkdir "$dst_path" or die "mkdir failed: $!";
 	} elsif (! -d "$dst_path") {
-	    Die "$dst_path exists, but is not a directory";
+	    die "$dst_path exists, but is not a directory";
 	}
     } else {
 	# Don't overwrite files unless $copy_dir_overwrite is 1
 	if (!$copy_dir_overwrite && -e "$copy_dir_dst/$_") {
-	    Die "Failed to process file $File::Find::name: " .
+	    die "Failed to process file $File::Find::name: " .
 		"not overwriting file $copy_dir_dst/$_";
 	}
 
@@ -695,7 +2212,7 @@ sub remove_file_callback {
     }
     if (! exists $processed_files{$rel_path}) {
         unlink($File::Find::name) or
-            Die("Cannot remove file $File::Find::name");
+            die "Cannot remove file $File::Find::name";
     }
 }
 
@@ -840,20 +2357,6 @@ sub copy_back {
                                       "Original undo directory");
     }
 
-    # check that the original options file and the backup options file have
-    # the same value for "innodb_data_file_path" option
-    #$backup_innodb_data_file_path = 
-    #    get_option(\%backup_config, 'mysqld', 'innodb_data_file_path');
-    #if (!are_equal_innodb_data_file_paths($orig_innodb_data_file_path, 
-    #                                      $backup_innodb_data_file_path)
-    #) {
-    #    Die "The value of 'innodb_data_file_path' option in the original "
-    #      . "my.cnf file '$config_file' is different from the value "
-    #      . "in the backup my.cnf file '$backup_config_file'.\n(original: "
-    #      . "'$orig_innodb_data_file_path')\n"
-    #      . "(backup:   '$backup_innodb_data_file_path')";
-    #}
-
     # make a list of all ibdata files in the backup directory and all
     # directories in the backup directory under which there are ibdata files
     foreach my $c (parse_innodb_data_file_path($orig_innodb_data_file_path)) {
@@ -861,16 +2364,33 @@ sub copy_back {
         # check that the backup data file exists
         if (! -e "$backup_dir/$c->{filename}") {
             if (-e "$backup_dir/$c->{filename}.ibz") {
-                Die "Backup data file '$backup_dir/$c->{filename}' "
+                die "Backup data file '$backup_dir/$c->{filename}' "
                   . "does not exist, but "
                   . "its compressed copy '$c->{path}.ibz' exists. Check "
+                  . "that you have decompressed "
+                  . " before attempting "
+                  . "'$innobackup_script --copy-back ...'  "
+                  . "or '$innobackup_script --move-back ...' !";
+            } elsif (-e "$backup_dir/$c->{filename}.qp") {
+                die "Backup data file '$backup_dir/$c->{filename}' "
+                  . "does not exist, but "
+                  . "its compressed copy '$c->{path}.qp' exists. Check "
                   . "that you have run "
-                  . "'$innobackup_script --apply-log --uncompress "
+                  . "'$innobackup_script --decompress "
+                  . "...' before attempting "
+                  . "'$innobackup_script --copy-back ...'  "
+                  . "or '$innobackup_script --move-back ...' !";
+            } elsif (-e "$backup_dir/$c->{filename}.xbcrypt") {
+                die "Backup data file '$backup_dir/$c->{filename}' "
+                  . "does not exist, but "
+                  . "its compressed copy '$c->{path}.xbcrypt' exists. Check "
+                  . "that you have run "
+                  . "'$innobackup_script --decrypt "
                   . "...' before attempting "
                   . "'$innobackup_script --copy-back ...'  "
                   . "or '$innobackup_script --move-back ...' !";
             } else {
-                Die "Backup data file '$backup_dir/$c->{filename}' "
+                die "Backup data file '$backup_dir/$c->{filename}' "
                     . "does not exist.";
             }
         }
@@ -903,7 +2423,7 @@ sub copy_back {
     print STDERR "$prefix in '$backup_dir'\n";
     print STDERR "$prefix back to '$orig_undo_dir'\n";
     opendir(DIR, $backup_dir)
-        || Die "Can't open directory '$backup_dir': $!\n";
+        || die "Can't open directory '$backup_dir': $!";
     while (defined($file = readdir(DIR))) {
         if ($file =~ /^$ibundo_files$/ && -f "$backup_dir/$file") {
             $src_name = escape_path("$backup_dir/$file");
@@ -915,7 +2435,7 @@ sub copy_back {
 
     # copy InnoDB log files to original InnoDB log directory
     opendir(DIR, $backup_dir) 
-        || Die "Can't open directory '$backup_dir': $!\n";
+        || die "Can't open directory '$backup_dir': $!";
     print STDERR "\n$prefix Starting to $operation InnoDB log files\n";
     print STDERR "$prefix in '$backup_dir'\n";
     print STDERR "$prefix back to original InnoDB log directory '$orig_iblog_dir'\n";
@@ -958,9 +2478,6 @@ sub apply_log {
 
     $options = $options . "--prepare --target-dir=$backup_dir";
 
-    if ($option_uncompress) {
-        $options = $options . ' --uncompress';
-    }
     if ($option_export) {
         $options = $options . ' --export';
     }
@@ -999,7 +2516,7 @@ sub apply_log {
     $rcode = system("$cmdline");
     if ($rcode) {
         # failure
-        Die "\n$prefix ibbackup failed";
+        die "\n$prefix ibbackup failed";
     }
 
     # We should not create ib_logfile files if we prepare for following incremental applies
@@ -1011,7 +2528,7 @@ sub apply_log {
         $rcode = system("$cmdline");
         if ($rcode) {
             # failure
-            Die "\n$prefix xtrabackup (2nd execution) failed";
+            die "\n$prefix xtrabackup (2nd execution) failed";
         }
     }
 
@@ -1058,7 +2575,8 @@ sub wait_for_ibbackup_file_create {
 
         if ($ibbackup_pid == $pid) {
             # The file doesn't exist, but the process has terminated
-            Die "ibbackup child process has died";
+            $ibbackup_pid = '';
+            die "The xtrabackup child process has died";
         }
 
         sleep 1;
@@ -1092,7 +2610,7 @@ sub wait_for_ibbackup_suspend {
 #
 sub resume_ibbackup {
     my $suspend_file = shift;
-    unlink $suspend_file || Die "Failed to delete '$suspend_file': $!";
+    unlink $suspend_file || die "Failed to delete '$suspend_file': $!";
 }
 
 #
@@ -1108,7 +2626,7 @@ sub wait_for_ibbackup_log_copy_finish {
 
     wait_for_ibbackup_file_create($suspend_file);
 
-    unlink $suspend_file || Die "Failed to delete '$suspend_file': $!";
+    unlink $suspend_file || die "Failed to delete '$suspend_file': $!";
 }
 
 #
@@ -1243,10 +2761,10 @@ sub start_ibbackup {
             $ibbackup_pid = $pid;
         } else {
             # child process
-            exec($cmdline) || Die "Failed to exec ibbackup: $!";
+            exec($cmdline) || die "Failed to exec ibbackup: $!";
         }
     } else {
-        Die "failed to fork ibbackup child process: $!";
+        die "failed to fork ibbackup child process: $!";
     }
 }
                   
@@ -1296,7 +2814,7 @@ sub start_keepalives {
     my $con = shift;
 
     if (defined($con->{keep_alive_pid})) {
-        Die "Keep-alive process has already been started for this connection."
+        die "Keep-alive process has already been started for this connection."
     }
 
     my $keep_alive_pid = fork();
@@ -1340,7 +2858,7 @@ sub stop_keepalives {
     my $con = shift;
 
     if (!defined($con->{keep_alive_pid})) {
-        Die "Keep-alive process has never been started for this connection."
+        die "Keep-alive process has never been started for this connection."
     }
 
     kill 'INT', $con->{keep_alive_pid};
@@ -1348,7 +2866,7 @@ sub stop_keepalives {
     my $rc = $? >> 8;
 
     if ($rc != 0) {
-        Die "Keep-alive process died with exit code " . $rc;
+        die "Keep-alive process died with exit code " . $rc;
     }
     undef $con->{keep_alive_pid};
 }
@@ -1394,11 +2912,11 @@ sub mysql_connect {
 
     if ($args{abort_on_error}) {
         if (!$dbd_mysql_installed) {
-            die "ERROR: Failed to connect to MySQL server as " .
+            die "Failed to connect to MySQL server as " .
                 "DBD::mysql module is not installed";
         } else {
             if (!$con{dbh}) {
-                die "ERROR: Failed to connect to MySQL server: " .
+                die "Failed to connect to MySQL server: " .
                     $con{connect_error};
             }
         }
@@ -1417,6 +2935,7 @@ sub mysql_connect {
 #
 # mysql_query subroutine send a query to MySQL server child process.
 # Parameters:
+#    con       mysql connection
 #    query     query to execute
 #
 sub mysql_query {
@@ -1439,6 +2958,10 @@ sub mysql_query {
       } elsif ($query eq 'SHOW SLAVE STATUS') {
           $con->{slave_status} =
               $con->{dbh}->selectrow_hashref("SHOW SLAVE STATUS");
+      } elsif ($query eq 'SHOW PROCESSLIST' or
+               $query eq "SHOW FULL PROCESSLIST") {
+          $con->{processlist} =
+              $con->{dbh}->selectall_hashref($query, "Id");
       } else {
           $con->{dbh}->do($query);
       }
@@ -1448,7 +2971,7 @@ sub mysql_query {
       }
   };
   if ($EVAL_ERROR) {
-      Die "\nError executing '$query': $EVAL_ERROR\n";
+      die "\nError executing '$query': $EVAL_ERROR";
   }
 }
 
@@ -1507,16 +3030,8 @@ sub write_binlog_info {
     }
 
     # write binlog info file
-    open(FILE, ">$binlog_info") || Die "Failed to open file '$binlog_info': $!";
-    print FILE  "$filename\t$position\t\t$gtid\n";
-    close(FILE);
-
-    if ($option_stream) {
-        stream_encrypt_file($option_tmpdir, "xtrabackup_binlog_info")
-                            and Die "Failed to stream 'xtrabackup_binlog_info': $!";
-        unlink $binlog_info || Die "Failed to delete '$binlog_info': $!";
-    }
-
+    write_to_backup_file("$binlog_info", "$filename\t$position\t\t$gtid\n");
+    
     $mysql_binlog_position = "filename '$filename', position $position";
     if ($gtid) {
         $mysql_binlog_position .= ", gtid_executed $gtid";
@@ -1531,26 +3046,28 @@ sub write_galera_info {
     my $con = shift;
     my @lines;
     my @info_lines = ();
-    my $position = '';
-    my $filename = '';
+    my $state_uuid = '';
+    my $last_committed = '';
 
     # get binlog position
     get_mysql_status($con);
 
-    open(FILE, ">$galera_info") || 
-         Die "Failed to open file '$galera_info': $!";
+    $state_uuid = $con->{status}->{wsrep_local_state_uuid}->{Value};
+    $last_committed = $con->{status}->{wsrep_last_committed}->{Value};
 
-    print FILE $con->{status}->{wsrep_local_state_uuid}->{Value} . ":";
-    print FILE $con->{status}->{wsrep_last_committed}->{Value} . "\n";
+    if (!defined($state_uuid) || !defined($last_committed)) {
+        my $now = current_time();
 
-    close(FILE);
+        print STDERR "$now  $prefix Failed to get master wsrep state " .
+            "from SHOW STATUS\n";
+        print STDERR "$now  $prefix This means that the server is not a " .
+            "member of a cluster. Ignoring the --galera-info option\n";
 
-    if ($option_stream) {
-        stream_encrypt_file($option_tmpdir, "xtrabackup_galera_info")
-                            and Die "Failed to stream 'xtrabackup_galera_info': $!";
-        unlink $galera_info || Die "Failed to delete '$galera_info': $!";
+        return;
     }
 
+    write_to_backup_file("$galera_info", "$state_uuid" .
+      ":" . "$last_committed" . "\n");
 }
 
 
@@ -1589,17 +3106,168 @@ sub write_slave_info {
     }
 
     # print slave status to a file
-    open(FILE, ">$slave_info") || Die "Failed to open file '$slave_info': $!";
-    print FILE  "CHANGE MASTER TO MASTER_LOG_FILE='$filename', MASTER_LOG_POS=$position\n";
-    close(FILE);
+    write_to_backup_file("$slave_info", 
+      "CHANGE MASTER TO MASTER_LOG_FILE='$filename', MASTER_LOG_POS=$position\n");
+   
+    $mysql_slave_position = "master host '$master', filename '$filename', position $position";
+}
 
-    if ($option_stream) {
-        stream_encrypt_file($option_tmpdir, "xtrabackup_slave_info")
-                            and Die "Failed to stream 'xtrabackup_slave_info': $!";
-        unlink $slave_info || Die "Failed to delete '$slave_info': $!";
+sub eat_sql_whitespace {
+    my ($query) = @_;
+
+    while (1) {
+        if ($query =~ m/^\/\*/) {
+            $query =~ s/^\/\*.*?\*\///s;
+        } elsif ($query =~ m/^[ \t\n\r]/s) {
+            $query =~ s/^[ \t\n\r]+//s;
+        } elsif ($query =~ m/^\(/) {
+            $query =~ s/^\(//;
+        } else {
+            return $query;
+        }
     }
 
-    $mysql_slave_position = "master host '$master', filename '$filename', position $position";
+}
+
+
+sub is_query {
+    my ($query) = @_;
+
+    $query = eat_sql_whitespace($query);
+    if ($query =~
+        m/^(insert|update|delete|replace|alter|load|select|do|handler|call|execute|begin)/i) {
+        return 1;
+    }
+
+    return 0;
+}
+
+
+sub is_select_query {
+    my ($query) = @_;
+
+    $query = eat_sql_whitespace($query);
+    if ($query =~ m/^select/i) {
+        return 1;
+    }
+
+    return 0;
+}
+
+
+sub is_update_query {
+    my ($query) = @_;
+
+    $query = eat_sql_whitespace($query);
+    if ($query =~ m/^(insert|update|delete|replace|alter|load)/i) {
+        return 1;
+    }
+
+    return 0;
+}
+
+
+sub have_queries_to_wait_for {
+    my ($con, $threshold) = @_;
+
+    $now = current_time();
+
+    mysql_query($con, "SHOW FULL PROCESSLIST");
+
+    my $processlist = $con->{processlist};
+
+    while (my ($id, $process) = each %$processlist) {
+        if (defined($process->{Info}) &&
+            $process->{Time} >= $threshold &&
+            (($option_lock_wait_query_type eq "all" &&
+             is_query($process->{Info})) ||
+             is_update_query($process->{Info}))) {
+            print STDERR "\n$now  $prefix Waiting for query $id (duration " .
+                            "$process->{Time} sec): $process->{Info}\n";
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+sub kill_long_queries {
+    my ($con, $timeout) = @_;
+
+    $now = current_time();
+
+    mysql_query($con, "SHOW FULL PROCESSLIST");
+
+    my $processlist = $con->{processlist};
+
+    while (my ($id, $process) = each %$processlist) {
+        if (defined($process->{Info}) &&
+            $process->{Time} >= $timeout &&
+            (($option_kill_long_query_type eq "all" &&
+              is_query($process->{Info})) ||
+             is_select_query($process->{Info}))) {
+            print STDERR "\n$now  $prefix Killing query $id (duration " .
+                           "$process->{Time} sec): $process->{Info}\n";
+            mysql_query($con, "KILL $id");
+        }
+    }
+}
+
+
+sub wait_for_no_updates {
+    my ($con, $timeout, $threshold) = @_;
+    my $start_time = time();
+
+    while (time() <= $start_time + $timeout) {
+        if (!(have_queries_to_wait_for($con, $threshold))) {
+            return;
+        }
+        sleep(1);
+    }
+
+    die "Unable to obtain lock. Please try again.";
+}
+
+
+sub start_query_killer {
+
+    my ($kill_timeout, $pcon) = @_;
+    my $start_time = time();
+    my $pid = fork();
+
+    if ($pid) {
+        # parent process
+        $query_killer_pid = $pid;
+    } else {
+        # child process
+        my $end = 0;
+        local $SIG{HUP} = sub { $end = 1 };
+
+        $pcon->{dbh}->{InactiveDestroy} = 1;
+
+        sleep($kill_timeout);
+
+        my %con = mysql_connect(abort_on_error => 1, keepalives => 0);
+
+        while (!$end) {
+            kill_long_queries(\%con, time() - $start_time);
+            sleep(1);
+        }
+
+        mysql_close(\%con);
+
+        exit(0);
+    }
+}
+
+sub stop_query_killer {
+    if (defined($query_killer_pid)) {
+        kill 'HUP' => $query_killer_pid;
+        waitpid($query_killer_pid, 0);
+        undef $query_killer_pid;
+        print STDERR "Query killing process is finished\n";
+    }
 }
 
 
@@ -1608,10 +3276,20 @@ sub write_slave_info {
 # 
 sub mysql_lockall {
     my $con = shift;
+    my $queries_hash_ref;
+
+    if ($option_lock_wait_timeout) {
+        wait_for_no_updates($con, $option_lock_wait_timeout,
+                            $option_lock_wait_threshold);
+    }
 
     $now = current_time();
     print STDERR "$now  $prefix Starting to lock all tables...\n";
 
+    # start query killer process
+    if ($option_kill_long_queries_timeout) {
+        start_query_killer($option_kill_long_queries_timeout, $con);
+    }
     if (compare_versions($mysql_server_version, '4.0.22') == 0
         || compare_versions($mysql_server_version, '4.1.7') == 0) {
         # MySQL server version is 4.0.22 or 4.1.7
@@ -1622,9 +3300,12 @@ sub mysql_lockall {
         mysql_query($con, "FLUSH TABLES WITH READ LOCK");
         mysql_query($con, "COMMIT");
     }
+    # stop query killer process
+    if ($option_kill_long_queries_timeout) {
+        stop_query_killer();
+    }
     write_binlog_info($con);
     write_galera_info($con) if $option_galera_info;
-	
     $now = current_time();
     print STDERR "$now  $prefix All tables locked and flushed to disk\n";
 }
@@ -1648,17 +3329,6 @@ sub mysql_unlockall {
     $now = current_time();
     print STDERR "$now  $prefix All tables unlocked\n";
 }
-
-#
-# kill_child_processes subroutine kills all child processes of this process.
-#
-sub kill_child_processes {
-    if ($ibbackup_pid) {
-        kill($kill_signal, $ibbackup_pid);
-        $ibbackup_pid = '';
-    }
-}
-
 
 #
 # require_external subroutine checks that an external program is runnable
@@ -1695,11 +3365,11 @@ sub require_external {
     if ($stderr ne '') {
         # failure
         unlink $tmp_stdout;
-        Die "Couldn't run $program: $stderr";
+        die "Couldn't run $program: $stderr";
     } elsif ($rcode) {
         # failure
         unlink $tmp_stdout;
-        Die "Couldn't run $program: $error";
+        die "Couldn't run $program: $error";
     }
 
     # success
@@ -1772,8 +3442,11 @@ sub init {
     my $run = '';
 
     # print some instructions to the user
-    if (!$option_apply_log && !$option_copy_back && !$option_move_back) {
+    if (!$option_apply_log && !$option_copy_back && !$option_move_back
+        && !$option_decrypt && !$option_decompress) {
         $run = 'backup';
+    } elsif ($option_decrypt || $option_decompress) {
+        $run = 'decryption and decompression';
     } elsif ($option_copy_back) {
         $run = 'copy-back';
     } elsif ($option_move_back) {
@@ -1785,7 +3458,8 @@ sub init {
     print STDERR "           At the end of a successful $run run $innobackup_script\n";
     print STDERR "           prints \"completed OK!\".\n\n";
 
-    if (!$option_copy_back && !$option_move_back) {
+    if (!$option_copy_back && !$option_move_back
+        && !$option_decrypt && !$option_decompress) {
         # we are making a backup or applying log to backup
         if (!$option_apply_log) {
             # we are making a backup, we need mysql server
@@ -1802,25 +3476,28 @@ sub init {
             && $ibbackup_version le "2.0") {
             # --include option was given, but ibbackup is too
             # old to support it
-            Die "--include option was given, but ibbackup is too old"
+            die "--include option was given, but ibbackup is too old"
                 . " to support it. You must upgrade to InnoDB Hot Backup"
                 . " v2.0 in order to use --include option.\n";
         }
     }
 
-    # read MySQL options file
-    #read_config_file($config_file, \%config);
-    read_config_file(\%config);
+    if (!$option_decrypt && !$option_decompress) {
+      # read MySQL options file
+      #read_config_file($config_file, \%config);
+      read_config_file(\%config);
 
-    if(!$option_tmpdir) {
-        $option_tmpdir = get_option(\%config, $option_defaults_group, 'tmpdir');
+      if(!$option_tmpdir) {
+          $option_tmpdir = get_option(\%config, $option_defaults_group, 'tmpdir');
+      }
     }
 
     # get innodb log home directory from options file
     #$innodb_log_group_home_dir = 
     #    get_option(\%config, 'mysqld', 'innodb_log_group_home_dir');
 
-    if (!$option_apply_log && !$option_copy_back && !$option_move_back) {
+    if (!$option_apply_log && !$option_copy_back && !$option_move_back
+        && !$option_decrypt && !$option_decompress) {
         # we are making a backup, create a new backup directory
         $backup_dir = File::Spec->rel2abs(make_backup_dir());
         print STDERR "$prefix Created backup directory $backup_dir\n";
@@ -1842,7 +3519,7 @@ sub init {
                     "WARNING : A left over instance of " .
                     "suspend file '$suspend_file' was found.\n";
                 unlink "$suspend_file"
-                    || Die "Failed to delete '$suspend_file': $!";
+                    || die "Failed to delete '$suspend_file': $!";
             }
         }
 
@@ -1851,7 +3528,7 @@ sub init {
                          "file '$option_tmpdir/$xtrabackup_pid_file' " .
                          "was found.\n";
             unlink $option_tmpdir . "/" . $xtrabackup_pid_file || 
-                Die "Failed to delete " .
+                die "Failed to delete " .
                     "'$option_tmpdir/$xtrabackup_pid_file': $!";
         }
 
@@ -1871,8 +3548,6 @@ sub init {
 #
 sub write_backup_config_file {
     my $filename = shift;
-
-    open(FILE, "> $filename") || Die "Failed to open file '$filename': $!";
 
     my @option_names = (
         "innodb_data_file_path",
@@ -1903,16 +3578,7 @@ sub write_backup_config_file {
                             'innodb_doublewrite_file')))[-1] . "\n";
     }
 
-    print FILE $options_dump;
-    close(FILE);
-
-    if ($option_stream) {
-        my $filename_dir = dirname($filename);
-        my $filename_name = basename($filename);
-        stream_encrypt_file($filename_dir, $filename_name)
-                            and Die "Failed to stream '$filename_name': $!";
-        unlink $filename || Die "Failed to delete '$filename': $!";
-    }
+    write_to_backup_file("$filename", "$options_dump");
 }
 
 
@@ -1937,17 +3603,13 @@ sub check_args {
         }
     }
 
-    if (@ARGV == 0) {
-        # no command line arguments
-        print STDERR "$prefix You must specify the backup directory.\n";
-        exit(1);
-    }
-
     # read command line options
     $rcode = GetOptions('compress' => \$option_compress,
+                        'decompress' => \$option_decompress,
                         'compress-threads=i' => \$option_compress_threads,
                         'compress-chunk-size=s' => \$option_compress_chunk_size,
                         'encrypt=s' => \$option_encrypt,
+                        'decrypt=s' => \$option_decrypt,
                         'encrypt-key=s' => \$option_encrypt_key,
                         'encrypt-key-file=s' => \$option_encrypt_key_file,
                         'encrypt-threads=i' => \$option_encrypt_threads,
@@ -1965,7 +3627,6 @@ sub check_args {
                         'databases=s' => \$option_databases,
                         'tables-file=s', => \$option_tables_file,
                         'use-memory=s' => \$option_use_memory,
-                        'uncompress' => \$option_uncompress,
                         'export' => \$option_export,
                         'password:s' => \$option_mysql_password,
                         'user=s' => \$option_mysql_user,
@@ -1996,13 +3657,27 @@ sub check_args {
                         'rebuild-indexes' => \$option_rebuild_indexes,
                         'rebuild-threads=i' => \$option_rebuild_threads,
                         'debug-sleep-before-unlock=i' =>
-                        \$option_debug_sleep_before_unlock
+                        \$option_debug_sleep_before_unlock,
+                        'kill-long-queries-timeout=i' =>
+                        \$option_kill_long_queries_timeout,
+                        'kill-long-query-type=s' =>
+                        \$option_kill_long_query_type,
+                        'lock-wait-timeout=i' => \$option_lock_wait_timeout,
+                        'lock-wait-threshold=i' => \$option_lock_wait_threshold,
+                        'lock-wait-query-type=s' =>
+                        \$option_lock_wait_query_type,
+                        'version-check' => \$option_version_check
     );
-                        
+
+    if (@ARGV == 0) {
+        die "You must specify the backup directory.\n";
+    } elsif (@ARGV > 1) {
+        die "Too many command line arguments\n";
+    }
+
     if (!$rcode) {
         # failed to read options
-        print STDERR "$prefix Bad command line arguments\n";
-        exit(1);
+        die "Bad command line arguments\n";
     }
     if ($option_help) {
         # print help text and exit
@@ -2016,9 +3691,8 @@ sub check_args {
     }
 
     if ($option_defaults_file && $option_defaults_extra_file) {
-        print STDERR "$prefix --defaults-file and --defaults-extra-file " .
+        die "--defaults-file and --defaults-extra-file " .
             "options are mutually exclusive";
-        exit(1);
     }
 
     if ($option_copy_back && $option_move_back) {
@@ -2036,33 +3710,43 @@ sub check_args {
         $option_compress = 0;
     }
 
+    # validate lock-wait-query-type and kill-long-query-type values
+    if (!(grep {$_ eq $option_lock_wait_query_type} qw/all update/)) {
+        die "Wrong value of lock-wait-query-type. ".
+            "Possible values are all|update, but $option_lock_wait_query_type ".
+            "is specified.";
+    }
+    if (!(grep {$_ eq $option_kill_long_query_type} qw/all select/)) {
+        die "Wrong value of kill-long-query-type. ".
+            "Possible values are all|select, but $option_kill_long_query_type ".
+            "is specified.";
+    }
+
+    if ($option_parallel && $option_parallel < 1) {
+        die "--parallel must be a positive value.\n";
+    }
+
     if ($option_stream eq 'tar') {
       $stream_cmd = 'tar chf -';
     } elsif ($option_stream eq 'xbstream') {
       $stream_cmd = 'xbstream -c';
-      if ($option_encrypt) {
-        $encrypt_cmd = "xbcrypt --encrypt-algo=$option_encrypt";
-        if ($option_encrypt_key) {
-          $encrypt_cmd = $encrypt_cmd . " --encrypt-key=$option_encrypt_key";
-        }
-        if ($option_encrypt_key_file) {
-          $encrypt_cmd = $encrypt_cmd . " --encrypt-key-file=$option_encrypt_key_file";
-        }
-        if ($option_encrypt_chunk_size) {
-          $encrypt_cmd = $encrypt_cmd . " --encrypt-chunk-size=$option_encrypt_chunk_size";
-        }
+    }
+
+    if ($option_encrypt) {
+      $encrypt_cmd = "xbcrypt --encrypt-algo=$option_encrypt";
+      if ($option_encrypt_key) {
+        $encrypt_cmd = $encrypt_cmd . " --encrypt-key=$option_encrypt_key";
+      }
+      if ($option_encrypt_key_file) {
+        $encrypt_cmd = $encrypt_cmd . " --encrypt-key-file=$option_encrypt_key_file";
+      }
+      if ($option_encrypt_chunk_size) {
+        $encrypt_cmd = $encrypt_cmd . " --encrypt-chunk-size=$option_encrypt_chunk_size";
       }
     }
 
-    if (@ARGV < 1) {
-        print STDERR "$prefix Missing command line argument\n";
-        exit(1);
-    } elsif (@ARGV > 1) {
-        print STDERR "$prefix Too many command line arguments\n";
-        exit(1);
-    }
-
-    if (!$option_apply_log && !$option_copy_back && !$option_move_back) {
+    if (!$option_apply_log && !$option_copy_back && !$option_move_back
+        && !$option_decrypt && !$option_decompress) {
         # we are making a backup, get backup root directory
         $option_backup = "1";
         $backup_root = $ARGV[0];
@@ -2083,14 +3767,18 @@ sub check_args {
 
     if ($option_slave_info) {
         if ($option_no_lock and !$option_safe_slave_backup) {
-	  print STDERR "--slave-info is used with --no-lock but without --safe-slave-backup. The binlog position cannot be consistent with the backup data.\n";
-	    exit(1);
+	  die "--slave-info is used with --no-lock but without --safe-slave-backup. The binlog position cannot be consistent with the backup data.\n";
 	}
     }
 
     if ($option_rsync && $option_stream) {
-        print STDERR "--rsync doesn't work with --stream\n";
-	exit(1);
+        die "--rsync doesn't work with --stream\n";
+    }
+
+    if ($option_decompress) {
+      if (system("which qpress &>/dev/null") >> 8 != 0) {
+        die "--decompress requires qpress\n";
+      }
     }
 
     print STDERR "\n";
@@ -2117,7 +3805,7 @@ sub make_backup_dir {
 
     $dir .= '/' . strftime("%Y-%m-%d_%H-%M-%S", localtime())
        unless $option_no_timestamp;
-    mkdir($dir, 0777) || Die "Failed to create backup directory $dir: $!";
+    mkdir($dir, 0777) || die "Failed to create backup directory $dir: $!";
 
     # create subdirectories for ibdata files if needed
 #    foreach my $a (split(/;/, $innodb_data_file_path)) {
@@ -2155,7 +3843,7 @@ sub create_path_if_needed {
         $path = $path . "/" . $a;
         if (! -d $path) {
             # this directory does not exist, create it !
-            mkdir($path, 0777) || Die "Failed to create backup directory: $!";
+            mkdir($path, 0777) || die "Failed to create backup directory: $!";
         }
     }
 }
@@ -2215,11 +3903,11 @@ sub backup_files {
 	    $rsync_file_list = $rsync_tmpfile_pass2;
 	}
 	open(RSYNC, ">$rsync_file_list")
-	    || Die "Can't open $rsync_file_list for writing: $!\n";
+	    || die "Can't open $rsync_file_list for writing: $!";
     }
 
     opendir(DIR, $source_dir) 
-        || Die "Can't open directory '$source_dir': $!\n";
+        || die "Can't open directory '$source_dir': $!";
     $now = current_time();
     if ($prep_mode) {
 	$operation = "a prep copy of";
@@ -2242,7 +3930,7 @@ sub backup_files {
             if (! -e "$backup_dir/$database") {
                 # create database directory for the backup
                 mkdir("$backup_dir/$database", 0777)
-                    || Die "Couldn't create directory '$backup_dir/$database': $!";
+                    || die "Couldn't create directory '$backup_dir/$database': $!";
             }
         }
 
@@ -2283,30 +3971,8 @@ sub backup_files {
 		if (!$prep_mode) {
 		    $rsync_files_hash{"$database/$file"} = 1;
 		}
-            } elsif (!$option_stream) {
-                $src_name = escape_path("$source_dir/$database/$file");
-                $dst_name = escape_path("$backup_dir/$database");
-                # Copy the file - If we get an error and the file actually exists, die with error msg
-                copy_if_exists("$src_name", "$dst_name")
-                  or Die "Failed to copy file '$file': $!";
             } else {
-                my $ret = 0;
-                my $file_name = substr($file, rindex($file, '/') + 1);
-                $file_name=~s/([\$\\\" ])/\\$1/g;
-                $ret = stream_encrypt_file($source_dir, "$database/$file_name") >> 8;
-                if ($ret == 1 && $option_stream eq 'tar') {
-                    print STDERR "$prefix If you use GNU tar, this warning can be ignored.\n";
-                # Check for non-zero exit code
-                } elsif ($ret != 0) {
-                    print STDERR "$prefix $stream_cmd returned with exit code $ret.\n";
-                    # Only treat as fatal cases where the file exists
-                    if ( -e "$database/$file_name" ) {
-                        Die "Failed to stream '$database/$file_name': $!";
-                    } else {
-                        print STDERR "$prefix Ignoring nonexistent file '$database/$file_name'.\n";
-                    }
-
-                }
+              backup_file("$source_dir", "$database/$file", "$backup_dir/$database/$file")
             }
         }
     }
@@ -2331,7 +3997,7 @@ sub backup_files {
 	# ignore errors in the prep mode, since we are running without lock,
 	# so some files may have disappeared.
 	if (system("$rsync_cmd") && !$prep_mode) {
-	    Die "rsync failed: $!\n";
+	    die "rsync failed: $!";
 	}
 
 	$now = current_time();
@@ -2342,7 +4008,7 @@ sub backup_files {
 	# with --files-from.
 	if (!$prep_mode && !$option_no_lock) {
 	    open(RSYNC, "<$rsync_tmpfile_pass1")
-		|| Die "Can't open $rsync_tmpfile_pass1 for reading: $!\n";
+		|| die "Can't open $rsync_tmpfile_pass1 for reading: $!";
 
 	    while (<RSYNC>) {
 		chomp;
@@ -2354,9 +4020,9 @@ sub backup_files {
 
 	    close(RSYNC);
 	    unlink "$rsync_tmpfile_pass1" || \
-		Die "Failed to delete $rsync_tmpfile_pass1: $!";
+		die "Failed to delete $rsync_tmpfile_pass1: $!";
 	    unlink "$rsync_tmpfile_pass2" || \
-		Die "Failed to delete $rsync_tmpfile_pass2: $!";
+		die "Failed to delete $rsync_tmpfile_pass2: $!";
 	}
     }
 
@@ -2382,9 +4048,9 @@ sub file_to_array {
     my $filename = shift;
     my $lines_ref = shift;
     
-    open(FILE, $filename) || Die "can't open file '$filename': $!";
+    open(FILE, $filename) || die "can't open file '$filename': $!";
     @{$lines_ref} = <FILE>;
-    close(FILE) || Die "can't close file '$filename': $!";
+    close(FILE) || die "can't close file '$filename': $!";
 
     foreach my $a (@{$lines_ref}) {
         chomp($a);
@@ -2554,8 +4220,7 @@ sub has_option {
 
     if (!exists ${$config_ref}{$group}) {
         # no group
-        print STDERR "$prefix fatal error: no '$group' group in MySQL options\n";
-        exit(1);
+        die "no '$group' group in MySQL options";
     }
 
     $group_hash_ref = ${$config_ref}{$group};
@@ -2581,15 +4246,13 @@ sub get_option {
 
     if (!exists $config{$group}) {
         # no group
-        print STDERR "$prefix fatal error: no '$group' group in MySQL options\n";
-        exit(1);
+        die "no '$group' group in MySQL options";
     }
     
     $group_hash_ref = ${$config_ref}{$group};
     if (!exists ${$group_hash_ref}{$option_name}) {
         # no option
-        print STDERR "$prefix fatal error: no '$option_name' option in group '$group' in MySQL options\n";
-        exit(1);
+        die "no '$option_name' option in group '$group' in MySQL options";
     }
 
     return ${$group_hash_ref}{$option_name};
@@ -2700,7 +4363,7 @@ sub parse_databases_option_value {
         # the option value is pathname of the file containing
         # list of databases
         if (! -f $option_databases) {
-            Die "can't find file '$option_databases'";
+            die "can't find file '$option_databases'";
         }
 
         # read from file the value of --databases option
@@ -2810,11 +4473,11 @@ sub set_xtrabackup_version {
 
 
     if($var_version =~ m/5\.0\.\d/) {
-	Die "MySQL 5.0 support was removed in Percona XtraBackup 2.1. The last version to support MySQL 5.0 was Percona XtraBackup 2.0.";
+	die "MySQL 5.0 support was removed in Percona XtraBackup 2.1. The last version to support MySQL 5.0 was Percona XtraBackup 2.0.\n";
     }
 
     if($var_version =~ m/5\.1\.\d/ && !defined($var_innodb_version)) {
-	Die "Support for MySQL 5.1 with builtin InnoDB (not the plugin) was removed in Percona XtraBackup 2.1. The last version to support MySQL 5.1 with builtin InnoDB was Percona XtraBackup 2.0.";
+	die "Support for MySQL 5.1 with builtin InnoDB (not the plugin) was removed in Percona XtraBackup 2.1. The last version to support MySQL 5.1 with builtin InnoDB was Percona XtraBackup 2.0.\n";
     }
 
     if($var_version =~ m/5\.1\.\d/) {
@@ -2838,7 +4501,7 @@ sub set_xtrabackup_version {
     }
 
     if (!$ibbackup_binary) {
-        Die "Unsupported server version: '$var_version' " .
+        die "Unsupported server version: '$var_version' " .
             "(InnoDB version: '$var_innodb_version'). " .
             "Please report a bug at ".
             "https://bugs.launchpad.net/percona-xtrabackup\n";
@@ -2860,17 +4523,18 @@ sub wait_for_safe_slave {
    $sql_thread_started = 0;
    get_mysql_slave_status($con);
 
-   if (defined($con->{slave_status}->{Read_Master_Log_Pos})) {
+   if (defined($con->{slave_status}->{Read_Master_Log_Pos}) and
+       defined($con->{slave_status}->{Slave_SQL_Running})) {
          $host_is_slave = 1;
-   }
-
-   if ($con->{slave_status}->{Slave_SQL_Running} =~ m/Yes/ ) {
-         $sql_thread_started = 1;
    }
 
    if ( !$host_is_slave ) {
       print STDERR "$prefix: Not checking slave open temp tables for --safe-slave-backup because host is not a slave\n";
       return;
+   }
+
+   if ($con->{slave_status}->{Slave_SQL_Running} =~ m/Yes/ ) {
+         $sql_thread_started = 1;
    }
 
    if ($sql_thread_started) {
@@ -2905,7 +4569,7 @@ sub wait_for_safe_slave {
        mysql_query($con, 'START SLAVE SQL_THREAD');
    }
 
-   Die "Slave_open_temp_tables did not become zero after waiting $option_safe_slave_backup_timeout seconds";
+   die "Slave_open_temp_tables did not become zero after $option_safe_slave_backup_timeout seconds";
 }
 
 sub get_slave_open_temp_tables {
@@ -2914,26 +4578,134 @@ sub get_slave_open_temp_tables {
     get_mysql_status($con);
 
     if (!defined($con->{status}->{Slave_open_temp_tables})) {
-        Die "Failed to get Slave_open_temp_tables from SHOW STATUS"
+        die "Failed to get Slave_open_temp_tables from SHOW STATUS"
     }
     if (!defined($con->{status}->{Slave_open_temp_tables}->{Value})) {
-        Die "SHOW STATUS LIKE 'slave_open_temp_tables' did not return anything"
+        die "SHOW STATUS LIKE 'slave_open_temp_tables' did not return anything"
     }
 
    return $con->{status}->{Slave_open_temp_tables}->{Value};
 }
 
-sub stream_encrypt_file {
-  my $basedir = shift;
-  my $relpath = shift;
-  my $rcode;
+#
+# Streams a file into the backup set,
+# handles any encryption.
+# Should not be called directly, only meant to be called from backup_file.
+#
+sub backup_file_via_stream {
+  my $src_path = shift;
+  my $src_file = shift;
+  my $ret = 0;
 
-  if ($encrypt_cmd) {
-    $rcode = system("cd $basedir; $stream_cmd $relpath | $encrypt_cmd");
+  my $filepos = rindex($src_file, '/');
+  my $file_name = '';
+  my $rel_path = '';
+
+  if ($filepos >= 0) {
+    $file_name = substr($src_file, $filepos + 1);
+    $rel_path = substr($src_file, 0, $filepos);
   } else {
-    $rcode = system("cd $basedir; $stream_cmd $relpath");
+    $file_name = $src_file;
+    $rel_path = '.';
   }
-  return $rcode;
+  $file_name=~s/([\$\\\" ])/\\$1/g;
+  if ($encrypt_cmd) {
+    $ret = system("cd $src_path; $stream_cmd $rel_path/$file_name | $encrypt_cmd") >> 8;
+  } else {
+    $ret = system("cd $src_path; $stream_cmd $rel_path/$file_name") >> 8;
+  }
+
+  if ($ret == 1 && $option_stream eq 'tar') {
+    print STDERR "$prefix If you use GNU tar, this warning can be ignored.\n";
+  # Check for non-zero exit code
+  } elsif ($ret != 0) {
+    if ($encrypt_cmd) {
+      print STDERR "$prefix '$stream_cmd | $encrypt_cmd' returned with exit code $ret.\n";
+    } else {
+      print STDERR "$prefix '$stream_cmd' returned with exit code $ret.\n";
+    }
+    # Only treat as fatal cases where the file exists
+    if ( -e "$src_path/$src_file" ) {
+      die "Failed to stream '$src_path/$src_file': $ret";
+    } else {
+      print STDERR "$prefix Ignoring nonexistent file '$src_path/$src_file'.\n";
+    }
+  }
+}
+
+#
+# Copies a file into the backup set,
+# handles any encryption.
+# Should not be called directly, only meant to be called from backup_file.
+#
+sub backup_file_via_copy {
+  my $src_path = shift;
+  my $src_file = shift;
+  my $dst_file = shift;
+  my $ret = 0;
+
+  # Copy the file - If we get an error and the file actually exists, die with error msg
+  my $src_file_esc = escape_path("$src_path/$src_file");
+  my $dst_file_esc = escape_path("$dst_file");
+  if ($encrypt_cmd) {
+    $dst_file_esc = $dst_file_esc . ".xbcrypt";
+    $ret = system("$encrypt_cmd -i \"$src_file_esc\" -o \"$dst_file_esc\"");
+    if ($ret != 0) {
+      die "Failed to copy and encrypt file '$src_file': $ret";
+    }
+  } elsif ( -e "$src_file_esc" ) {
+    $ret = system("$CP_CMD \"$src_file_esc\" \"$dst_file_esc\"");
+    if ($ret != 0) {
+       die "Failed to copy file '$src_file': $ret";
+     }
+  }
+}
+
+#
+# Copies or streams a file into the backup set,
+# handles any streaming and/or encryption.
+# All files to be placed into the backup set should only be put there
+# through this call, write_backup_to_file ot xtrabackup itself. If any
+# other method is used, files may not be properly formatted
+# (stream, encryption, etc).
+#
+sub backup_file {
+  my $src_path = shift;
+  my $src_file = shift;
+  my $dst_file = shift;
+
+  if ($option_stream) {
+    backup_file_via_stream($src_path, $src_file);
+  } else {
+    backup_file_via_copy($src_path, $src_file, $dst_file);
+  }
+}
+
+#
+# Writes data directly into a file within the root of the backup set,
+# handles any streaming and/or encryption.
+#
+sub write_to_backup_file {
+  my $file_name = shift;
+  my $write_data = shift;
+
+  if ($option_stream) {
+    my $filepos = rindex($file_name, '/');
+    my $dst_file = substr($file_name, $filepos + 1);
+    my $dst_path = substr($file_name, 0, $filepos + 1);
+ 
+    open XTRABACKUP_FH, "> $option_tmpdir/$dst_file"
+      || die "Cannot open file $option_tmpdir/$dst_file: $!\n";
+    print XTRABACKUP_FH $write_data;
+    close XTRABACKUP_FH;
+    backup_file($option_tmpdir, $dst_file, $file_name);
+    unlink "$option_tmpdir/$dst_file";
+  } else {
+    open XTRABACKUP_FH, "> $file_name"
+      || die "Cannot open file $file_name: $!\n";
+    print XTRABACKUP_FH $write_data;
+    close XTRABACKUP_FH;
+  }
 }
 
 #
@@ -2954,8 +4726,8 @@ innobackupex - Non-blocking backup tool for InnoDB, XtraDB and HailDB databases
 =head1 SYNOPOSIS
 
 innobackupex [--compress] [--compress-threads=NUMBER-OF-THREADS] [--compress-chunk-size=CHUNK-SIZE]
-             [--encrypt=encryption_algorithm] [--encrypt-threads=NUMBER-OF-THREADS] [--encrypt-chunk-size=CHUNK-SIZE]
-             [--encrypt-key=literal_encryption_key] | [--encryption-key-file=MY.KEY]
+             [--encrypt=ENCRYPTION-ALGORITHM] [--encrypt-threads=NUMBER-OF-THREADS] [--encrypt-chunk-size=CHUNK-SIZE]
+             [--encrypt-key=LITERAL-ENCRYPTION-KEY] | [--encryption-key-file=MY.KEY]
              [--include=REGEXP] [--user=NAME]
              [--password=WORD] [--port=PORT] [--socket=SOCKET]
              [--no-timestamp] [--ibbackup=IBBACKUP-BINARY]
@@ -2968,7 +4740,7 @@ innobackupex [--compress] [--compress-threads=NUMBER-OF-THREADS] [--compress-chu
              [--compact]     
              BACKUP-ROOT-DIR
 
-innobackupex --apply-log [--use-memory=B] [--uncompress]
+innobackupex --apply-log [--use-memory=B]
              [--defaults-file=MY.CNF]
              [--export] [--redo-only] [--ibbackup=IBBACKUP-BINARY]
              BACKUP-DIR
@@ -2976,6 +4748,10 @@ innobackupex --apply-log [--use-memory=B] [--uncompress]
 innobackupex --copy-back [--defaults-file=MY.CNF] [--defaults-group=GROUP-NAME] BACKUP-DIR
 
 innobackupex --move-back [--defaults-file=MY.CNF] [--defaults-group=GROUP-NAME] BACKUP-DIR
+
+innobackupex [--decompress] [--decrypt=ENCRYPTION-ALGORITHM]
+             [--encrypt-key=LITERAL-ENCRYPTION-KEY] | [--encryption-key-file=MY.KEY]
+             [--parallel=NUMBER-OF-FORKS] BACKUP-DIR
 
 =head1 DESCRIPTION
 
@@ -3010,6 +4786,16 @@ The --move-back command is similar to --copy-back with the only difference that
 it moves files to their original locations rather than copies them. As this
 option removes backup files, it must be used with caution. It may be useful in
 cases when there is not enough free disk space to copy files.
+
+The --decompress --decrypt command will decrypt and/or decompress a backup made
+with the --compress and/or --encrypt options. When decrypting, the encryption
+algorithm and key used when the backup was taken MUST be provided via the
+specified options. --decrypt and --decompress may be used together at the same
+time to completely normalize a previously compressed and encrypted backup. The
+--parallel option will allow multiple files to be decrypted and/or decompressed
+simultaneously. In order to decompress, the qpress utility MUST be installed
+and accessable within the path. This process will remove the original
+compressed/encrypted files and leave the results in the same location.
 
 On success the exit code innobackupex is 0. A non-zero exit code 
 indicates an error.
@@ -3053,6 +4839,14 @@ Copy all the files in a previously made backup from the backup directory to thei
 
 This option specifies the list of databases that innobackupex should back up. The option accepts a string argument or path to file that contains the list of databases to back up. The list is of the form "databasename1[.table_name1] databasename2[.table_name2] . . .". If this option is not specified, all databases containing MyISAM and InnoDB tables will be backed up.  Please make sure that --databases contains all of the InnoDB databases and tables, so that all of the innodb.frm files are also backed up. In case the list is very long, this can be specified in a file, and the full path of the file can be specified instead of the list. (See option --tables-file.)
 
+=item --decompress
+
+Decompresses all files with the .qp extension in a backup previously made with the --compress option.
+
+=item --decrypt=ENCRYPTION-ALGORITHM
+
+Decrypts all files with the .xbcrypt extension in a backup previously made with --encrypt option.
+
 =item --debug-sleep-before-unlock=SECONDS
 
 This is a debug-only option used by the XtraBackup test suite.
@@ -3065,23 +4859,23 @@ This option specifies what file to read the default MySQL options from.  The opt
 
 This option specifies what extra file to read the default MySQL options from before the standard defaults-file.  The option accepts a string argument. It is also passed directly to xtrabackup's --defaults-extra-file option. See the xtrabackup documentation for details.
 
-=item --encrypt=ENCRYPTION_ALGORITHM
+=item --encrypt=ENCRYPTION-ALGORITHM
 
 This option instructs xtrabackup to encrypt backup copies of InnoDB data
-files using the algorithm specified in the ENCRYPTION_ALGORITHM.
+files using the algorithm specified in the ENCRYPTION-ALGORITHM.
 It is passed directly to the xtrabackup child process.
 Try 'xtrabackup --help' for more details.
 
-=item --encrypt-key=ENCRYPTION_KEY
+=item --encrypt-key=ENCRYPTION-KEY
 
-This option instructs xtrabackup to use the given ENCRYPTION_KEY when using the --encrypt option.
-It is passed directly to the xtrabackup child process.
+This option instructs xtrabackup to use the given ENCRYPTION-KEY when using the --encrypt or --decrypt options.
+During backup it is passed directly to the xtrabackup child process.
 Try 'xtrabackup --help' for more details.
 
-=item --encrypt-key-file=ENCRYPTION_KEY_FILE
+=item --encrypt-key-file=ENCRYPTION-KEY-FILE
 
-This option instructs xtrabackup to use the encryption key stored in the given ENCRYPTION_KEY_FILE when using the --encrypt option.
-It is passed directly to the xtrabackup child process.
+This option instructs xtrabackup to use the encryption key stored in the given ENCRYPTION-KEY-FILE when using the --encrypt or --decrypt options.
+
 Try 'xtrabackup --help' for more details.
 
 =item --encrypt-threads
@@ -3106,7 +4900,7 @@ This option specifies the directory in which to save an extra copy of the "xtrab
 
 =item --galera-info
 
-This options creates the xtrabackup_galera_info file which contians the local node state at the time of the backup. Option should be used when performing the backup of Percona-XtraDB-Cluster.
+This options creates the xtrabackup_galera_info file which contains the local node state at the time of the backup. Option should be used when performing the backup of Percona-XtraDB-Cluster.
 
 =item --help
 
@@ -3148,6 +4942,27 @@ This option specifies time interval between checks done by log copying thread in
 
 This option specifies the log sequence number (LSN) to use for the incremental backup.  The option accepts a string argument. It is used with the --incremental option. It is used instead of specifying --incremental-basedir. For databases created by MySQL and Percona Server 5.0-series versions, specify the LSN as two 32-bit integers in high:low format. For databases created in 5.1 and later, specify the LSN as a single 64-bit integer.
 
+=item --kill-long-queries-timeout=SECONDS
+
+This option specifies the number of seconds innobackupex waits between starting FLUSH TABLES WITH READ LOCK and killing those queries that block it. Default is 0 seconds, which means innobackupex will not attempt to kill any queries.
+
+=item --kill-long-query-type=all|update
+
+This option specifies which types of queries should be killed to unblock the global lock. Default is "all".
+
+=item --lock-wait-timeout=SECONDS
+
+This option specifies time in seconds that innobackupex should wait for queries that would block FTWRL before running it. If there are still such queries when the timeout expires, innobackupex terminates with an error.
+Default is 0, in which case innobackupex does not wait for queries to complete and starts FTWRL immediately.
+
+=item --lock-wait-threshold=SECONDS
+
+This option specifies the query run time threshold which is used by innobackupex to detect long-running queries with a non-zero value of --lock-wait-timeout. FTWRL is not started until such long-running queries exist. This option has no effect if --lock-wait-timeout is 0. Default value is 60 seconds.
+
+=item --lock-wait-query-type=all|update
+
+This option specifies which types of queries are allowed to complete before innobackupex will issue the global lock. Default is all.
+
 =item --move-back
 
 Move all the files in a previously made backup from the backup directory to the actual datadir location. Use with caution, as it removes backup files.
@@ -3162,8 +4977,9 @@ This option prevents creation of a time-stamped subdirectory of the BACKUP-ROOT-
 
 =item --parallel=NUMBER-OF-THREADS
 
-This option specifies the number of threads the xtrabackup child process should use to back up files concurrently.  The option accepts an integer argument. It is passed directly to xtrabackup's --parallel option. See the xtrabackup documentation for details.
-
+On backup, this option specifies the number of threads the xtrabackup child process should use to back up files concurrently.  The option accepts an integer argument. It is passed directly to xtrabackup's --parallel option. See the xtrabackup documentation for details.
+ 
+On --decrypt or --decompress it specifies the number of parallel forks that should be used to process the backup files.
 
 =item --password=WORD
 

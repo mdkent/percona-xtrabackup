@@ -139,7 +139,7 @@ endif
 
 5.6: MYSQLOBJS = $(MYSQL_ROOT_DIR)/libmysqld/libmysqld.a
 ifeq ($(shell uname -s),Linux)
-5.6: LIBS += -laio -ldl -lcrypt -lssl
+5.6: LIBS += -laio -ldl -lcrypt
 endif
 5.6: TARGET := xtrabackup_56
 # In CMake server builds it is important to build with exactly the same preprocessor flags
@@ -183,7 +183,7 @@ xtradb: INNODBOBJS = $(addprefix \
 	usr0sess.o ut0byte.o ut0dbg.o \
 	ut0list.o ut0mem.o ut0rnd.o \
 	ut0ut.o ut0vec.o ut0wqueue.o \
-	ut0rbt.o)
+	ut0rbt.o log0online.o)
 xtradb: MYSQLOBJS = $(addprefix $(MYSQL_ROOT_DIR)/, mysys/libmysys.a \
 	strings/libmystrings.a zlib/.libs/libzlt.a dbug/libdbug.a)
 xtradb: DEFS += -DXTRADB_BASED 
